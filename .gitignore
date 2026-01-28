@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+
+# Local data & artifacts (keep directory structure via .gitkeep)
+data/**
+!data/.gitkeep
+!data/input/.gitkeep
+!data/output/.gitkeep
+

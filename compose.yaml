@@ -1,0 +1,28 @@
+services:
+  ocr-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./:/workspace
+      - ./data:/data
+      - hf-cache:/cache/huggingface
+    working_dir: /workspace
+    environment:
+      - HF_HOME=/cache/huggingface
+      - DEEPSEEK_OCR2_MODEL_NAME=deepseek-ai/DeepSeek-OCR-2
+      # Optional: set in `.env` to pin revision (see `.env.example`)
+      # - DEEPSEEK_OCR2_MODEL_REVISION=
+    # NOTE:
+    # - `deploy:` is the Compose-spec way to request GPUs. Verify with:
+    #   `docker compose run --rm ocr-agent nvidia-smi`
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
