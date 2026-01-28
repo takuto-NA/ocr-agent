@@ -103,3 +103,45 @@ DeepSeek-OCR-2は `trust_remote_code=True` が必要です。初回実行時に�
 環境変数:
 - `DEEPSEEK_OCR2_MODEL_NAME`（デフォルト: `deepseek-ai/DeepSeek-OCR-2`）
 - `DEEPSEEK_OCR2_MODEL_REVISION`（空なら未固定）
+
+## GUI（Tauri）: ドラッグ&ドロップでジョブ実行（MVP）
+このGUIは **既存のDocker+CLIをそのまま使うジョブランナー** です。
+
+できること（MVP）:
+- 出力先（=ジョブルート）を選ぶ
+- 画像/PDF/フォルダをドラッグ&ドロップ（内部的に `input/` にコピー）
+- Startで `enqueue → run` を実行
+- `queue.sqlite3` を監視して進捗/ETA表示
+- 完了すると `output.md` がジョブルートに生成される
+
+### 前提
+- Docker Desktop（WSL2 backend）+ NVIDIA GPU（CLIと同じ）
+- Node.js（`npm`）
+- Rust toolchain（`cargo` が使えること）
+  - Windowsの場合、Tauriのビルドに Visual Studio Build Tools が必要になることがあります
+
+### 起動（開発）
+PowerShellで、リポジトリルートから実行してください。
+
+```powershell
+# 1) OCR用Dockerイメージ（初回は重い）
+docker compose build
+
+# 2) GUI依存を入れる
+cd gui
+npm install
+
+# 3) GUI起動（Tauri dev）
+npm run dev
+```
+
+GUIの使い方:
+- 「Select output directory」を押して出力先フォルダを選択（ここがジョブルートになります）
+- 画像/PDF/フォルダをウィンドウにドラッグ&ドロップ
+- 「Start OCR」で実行
+- 結果: `output.md`（中間: `output/`, キュー: `queue.sqlite3`, 入力コピー: `input/`）
+
+### メモ: リポジトリ外から実行したい場合
+GUIは `compose.yaml` を使ってDocker実行します。`compose.yaml` の場所が自動推定できない場合は、環境変数で指定できます。
+
+- `OCR_AGENT_REPO_ROOT`: `compose.yaml` があるリポジトリルート（例: `C:\\Users\\owner\\Documents\\git\\ocr-agent`）

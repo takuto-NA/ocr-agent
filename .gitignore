@@ -13,3 +13,15 @@ data/**
 !data/input/.gitkeep
 !data/output/.gitkeep
 
+# Tauri GUI (Node/Vite)
+gui/node_modules/
+gui/dist/
+gui/.vite/
+
+# Tauri (Rust)
+gui/src-tauri/target/
+gui/src-tauri/gen/
+
+# Misc
+*.log
+

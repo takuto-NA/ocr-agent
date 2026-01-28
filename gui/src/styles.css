@@ -1,0 +1,177 @@
+/* Responsibility:
+ * - Minimal, modern default styling for the OCR job runner UI.
+ */
+
+:root {
+  color-scheme: light dark;
+  --surface: rgba(255, 255, 255, 0.08);
+  --surface-strong: rgba(255, 255, 255, 0.14);
+  --border: rgba(255, 255, 255, 0.18);
+  --text: rgba(255, 255, 255, 0.92);
+  --muted: rgba(255, 255, 255, 0.7);
+  --danger: #ff5a5f;
+  --accent: #6ea8fe;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --surface: rgba(0, 0, 0, 0.04);
+    --surface-strong: rgba(0, 0, 0, 0.07);
+    --border: rgba(0, 0, 0, 0.12);
+    --text: rgba(0, 0, 0, 0.92);
+    --muted: rgba(0, 0, 0, 0.7);
+  }
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--text);
+  background: radial-gradient(circle at 15% 10%, rgba(110, 168, 254, 0.22), transparent 45%),
+    radial-gradient(circle at 85% 30%, rgba(140, 230, 150, 0.18), transparent 50%),
+    radial-gradient(circle at 40% 90%, rgba(250, 120, 255, 0.12), transparent 55%),
+    linear-gradient(180deg, rgba(15, 16, 20, 1), rgba(10, 10, 12, 1));
+}
+
+@media (prefers-color-scheme: light) {
+  body {
+    background: radial-gradient(circle at 15% 10%, rgba(110, 168, 254, 0.22), transparent 45%),
+      radial-gradient(circle at 85% 30%, rgba(140, 230, 150, 0.18), transparent 50%),
+      radial-gradient(circle at 40% 90%, rgba(250, 120, 255, 0.12), transparent 55%),
+      linear-gradient(180deg, rgba(248, 249, 252, 1), rgba(245, 246, 250, 1));
+  }
+}
+
+.container {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px 18px 40px;
+}
+
+.titleRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.title {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 0.2px;
+}
+
+.subtitle {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  backdrop-filter: blur(14px);
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.row > * {
+  flex: 0 0 auto;
+}
+
+.button {
+  border: 1px solid var(--border);
+  background: var(--surface-strong);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.buttonPrimary {
+  border-color: rgba(110, 168, 254, 0.55);
+}
+
+.buttonDanger {
+  border-color: rgba(255, 90, 95, 0.65);
+}
+
+.label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.dropZone {
+  border: 1px dashed var(--border);
+  border-radius: 14px;
+  padding: 18px;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+}
+
+.dropZoneStrong {
+  border-color: rgba(110, 168, 254, 0.7);
+  background: rgba(110, 168, 254, 0.08);
+}
+
+.progressOuter {
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.progressInner {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(110, 168, 254, 0.95), rgba(140, 230, 150, 0.85));
+}
+
+.logBox {
+  margin-top: 10px;
+  max-height: 320px;
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  padding: 10px;
+}
+
+.logLine {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  margin: 0 0 6px;
+}
+

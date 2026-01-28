@@ -1,0 +1,22 @@
+[package]
+name = "ocr-agent-gui"
+version = "0.1.0"
+description = "ocr-agent GUI (Tauri job runner)"
+authors = ["ocr-agent contributors"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
