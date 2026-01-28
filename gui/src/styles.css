@@ -11,6 +11,10 @@
   --muted: rgba(255, 255, 255, 0.7);
   --danger: #ff5a5f;
   --accent: #6ea8fe;
+  --previewPanelMinHeight: 220px;
+  --previewPanelPreferredHeight: 34vh;
+  --previewPanelMaxHeight: 360px;
+  --logPanelMinHeight: 240px;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
     "Apple Color Emoji", "Segoe UI Emoji";
 }
@@ -29,6 +33,7 @@ html,
 body {
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 body {
@@ -52,6 +57,114 @@ body {
   max-width: 980px;
   margin: 0 auto;
   padding: 24px 18px 40px;
+}
+
+.appShell {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.appHeader {
+  padding: 18px 18px 10px;
+}
+
+.appContent {
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 0 18px 18px;
+}
+
+.splitPane {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(360px, 420px) 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+
+@media (max-width: 920px) {
+  .splitPane {
+    grid-template-columns: 1fr;
+  }
+}
+
+.scrollColumn {
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.scrollColumn::-webkit-scrollbar {
+  width: 10px;
+}
+
+.scrollColumn::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+
+.rightColumn {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+.previewCard {
+  flex: 0 0 auto;
+}
+
+.logCard {
+  flex: 1 1 auto;
+  min-height: var(--logPanelMinHeight);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.logCardBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.previewContainer {
+  position: relative;
+  width: 100%;
+  height: clamp(var(--previewPanelMinHeight), var(--previewPanelPreferredHeight), var(--previewPanelMaxHeight));
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.previewImage {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.previewOverlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.previewBox {
+  position: absolute;
+  border: 2px solid rgba(110, 168, 254, 0.65);
+  background: rgba(110, 168, 254, 0.08);
+  box-sizing: border-box;
+}
+
+.previewBoxActive {
+  border-color: rgba(140, 230, 150, 0.85);
+  background: rgba(140, 230, 150, 0.10);
 }
 
 .titleRow {
@@ -173,5 +286,158 @@ body {
   font-size: 12px;
   line-height: 1.35;
   margin: 0 0 6px;
+}
+
+.input {
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  min-width: 220px;
+}
+
+.input:focus {
+  outline: 2px solid rgba(110, 168, 254, 0.55);
+  outline-offset: 1px;
+}
+
+.select {
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  min-width: 260px;
+}
+
+.textarea {
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 12px;
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.details {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.detailsSummary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.buttonSmall {
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-weight: 700;
+}
+
+.logToolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.logToolbarRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.logToolbarLeft,
+.logToolbarRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logFilters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.toggleLabel {
+  user-select: none;
+}
+
+.logScrollArea {
+  flex: 1 1 auto;
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+  padding: 10px;
+  min-height: 240px;
+}
+
+.logRow {
+  display: grid;
+  grid-template-columns: 86px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 2px 0;
+}
+
+.logTag {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.logMessage {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.logRowSource_stderr .logMessage {
+  color: rgba(255, 90, 95, 0.95);
+}
+
+.logRowSource_backend .logMessage {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.logRowSource_stdout .logMessage {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.logRowSource_ui .logMessage {
+  color: rgba(140, 230, 150, 0.9);
 }
 

@@ -11,7 +11,7 @@ import shutil
 import time
 
 from ocr_agent import __version__
-from ocr_agent.config import DeepSeekOcr2Settings, RuntimePaths
+from ocr_agent.config import DeepSeekOcr2Settings, MarkdownPostProcessingSettings, RuntimePaths
 from ocr_agent.deepseek_ocr2_runner import DeepSeekOcr2Runner
 from ocr_agent.input_discovery import (
     InputDiscoveryReport,
@@ -30,6 +30,8 @@ DEFAULT_OUTPUT_DIRECTORY_PATH = Path("/data/output")
 DEFAULT_MERGED_MARKDOWN_PATH = Path("/data/output.md")
 
 EXIT_CODE_NOTHING_ENQUEUED = 2
+
+UNSAFE_DELETION_PATH_STRINGS = {"", "/", ".", ".."}
 
 
 def main() -> None:
@@ -215,6 +217,7 @@ def _run_run_command(
 
     deepseek_settings = DeepSeekOcr2Settings.from_environment()
     deepseek_runner = DeepSeekOcr2Runner(settings=deepseek_settings)
+    post_processing_settings = MarkdownPostProcessingSettings.from_environment()
 
     processed_tasks_count = 0
     failed_tasks_count = 0
@@ -241,7 +244,11 @@ def _run_run_command(
                 raise
 
     tasks_in_enqueue_order = queue_store.fetch_tasks_in_enqueue_order()
-    merge_tasks_into_single_markdown(tasks_in_enqueue_order, runtime_paths.merged_markdown_path)
+    merge_tasks_into_single_markdown(
+        tasks_in_enqueue_order,
+        runtime_paths.merged_markdown_path,
+        post_processing_settings,
+    )
 
     print(
         f"Processed {processed_tasks_count} task(s), failed {failed_tasks_count} task(s). "
@@ -332,10 +339,9 @@ def _delete_output_paths_safely(
     output_directory_path: Path,
     merged_markdown_path: Path,
 ) -> None:
-    # Guard: Avoid accidentally deleting dangerous paths.
-    output_directory_path_string = str(output_directory_path)
-    if output_directory_path_string in {"", "/", "."}:
-        print("Refusing to delete output-dir: unsafe path")
+    # Guard: Avoid accidentally deleting dangerous paths (root, drive root, etc).
+    if _is_unsafe_deletion_target(output_directory_path):
+        print(f"Refusing to delete output-dir: unsafe path: {output_directory_path}")
         return
 
     if output_directory_path.exists() and output_directory_path.is_dir():
@@ -346,6 +352,23 @@ def _delete_output_paths_safely(
         merged_markdown_path.unlink()
         print(f"Deleted output-md: {merged_markdown_path}")
 
+
+def _is_unsafe_deletion_target(directory_path: Path) -> bool:
+    directory_path_string = str(directory_path).strip()
+    if directory_path_string in UNSAFE_DELETION_PATH_STRINGS:
+        return True
+
+    # Guard: refuse deleting filesystem roots (POSIX "/" or Windows drive roots like "C:\").
+    try:
+        resolved = directory_path.resolve()
+    except Exception:
+        # Guard: if the path cannot be resolved, treat it as unsafe for deletion.
+        return True
+
+    if resolved == resolved.parent:
+        return True
+
+    return False
 
 def _process_task_to_markdown(
     deepseek_runner: DeepSeekOcr2Runner,

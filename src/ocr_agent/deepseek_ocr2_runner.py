@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from ocr_agent.config import DeepSeekOcr2Settings
 
 
 DEFAULT_SAVED_MARKDOWN_FILENAME = "result.mmd"
+DEFAULT_MODEL_WORK_DIRECTORY_NAME = "_model_work"
 CUDA_NOT_AVAILABLE_ERROR_MESSAGE = (
     "CUDA GPU is not available inside the container.\n"
     "Verify Docker GPU passthrough first:\n"
@@ -54,6 +56,17 @@ def _read_saved_markdown_if_present(output_directory_path: Path) -> str | None:
     if not saved_markdown_path.exists():
         return None
     return saved_markdown_path.read_text(encoding="utf-8")
+
+def _delete_directory_tree_best_effort(directory_path: Path) -> None:
+    if not directory_path.exists():
+        return
+    if not directory_path.is_dir():
+        return
+    try:
+        shutil.rmtree(directory_path)
+    except Exception:
+        # Guard: cleanup should never break OCR.
+        return
 
 
 @dataclass
@@ -119,26 +132,47 @@ class DeepSeekOcr2Runner:
 
         output_directory_path.mkdir(parents=True, exist_ok=True)
 
+        # Guard: DeepSeek-OCR-2 can emit the Markdown only via saved artifacts (`result.mmd`).
+        # To keep the CLI flag behavior consistent:
+        # - save_results=True  => write artifacts directly under `output_directory_path`
+        # - save_results=False => write artifacts under a temporary subdirectory and delete it afterwards
+        model_output_directory_path = (
+            output_directory_path
+            if save_results
+            else (output_directory_path / DEFAULT_MODEL_WORK_DIRECTORY_NAME)
+        )
+        model_output_directory_path.mkdir(parents=True, exist_ok=True)
+
         tokenizer = self._get_tokenizer()
         model = self._get_model()
 
-        # Guard: DeepSeek-OCR-2 may print OCR results to stdout but return an empty value.
-        # To reliably obtain Markdown, always enable saving and read `result.mmd` when present.
-        infer_result = model.infer(
-            tokenizer,
-            prompt=self.settings.markdown_prompt,
-            image_file=str(image_file_path),
-            output_path=str(output_directory_path),
-            base_size=self.settings.base_image_size_pixels,
-            image_size=self.settings.inference_image_size_pixels,
-            crop_mode=self.settings.enable_crop_mode,
-            save_results=True,
-        )
+        markdown_result = ""
+        try:
+            # Guard: DeepSeek-OCR-2 may print OCR results to stdout but return an empty value.
+            # To reliably obtain Markdown, always enable saving and read `result.mmd` when present.
+            infer_result = model.infer(
+                tokenizer,
+                prompt=self.settings.markdown_prompt,
+                image_file=str(image_file_path),
+                output_path=str(model_output_directory_path),
+                base_size=self.settings.base_image_size_pixels,
+                image_size=self.settings.inference_image_size_pixels,
+                crop_mode=self.settings.enable_crop_mode,
+                save_results=True,
+            )
 
-        saved_markdown = _read_saved_markdown_if_present(output_directory_path)
-        if saved_markdown is not None and saved_markdown.strip() != "":
-            return saved_markdown
+            saved_markdown = _read_saved_markdown_if_present(model_output_directory_path)
+            if saved_markdown is not None and saved_markdown.strip() != "":
+                markdown_result = saved_markdown
+                return markdown_result
 
-        # Fallback: Some versions might still return the Markdown directly.
-        return _normalize_infer_result_to_markdown(infer_result)
+            # Fallback: Some versions might still return the Markdown directly.
+            markdown_result = _normalize_infer_result_to_markdown(infer_result)
+            return markdown_result
+        finally:
+            if save_results:
+                pass
+            # Guard: Only delete the dedicated subdirectory; never delete `output_directory_path` itself.
+            if not save_results and model_output_directory_path != output_directory_path:
+                _delete_directory_tree_best_effort(model_output_directory_path)
 

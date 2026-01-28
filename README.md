@@ -104,14 +104,14 @@ DeepSeek-OCR-2は `trust_remote_code=True` が必要です。初回実行時に�
 - `DEEPSEEK_OCR2_MODEL_NAME`（デフォルト: `deepseek-ai/DeepSeek-OCR-2`）
 - `DEEPSEEK_OCR2_MODEL_REVISION`（空なら未固定）
 
-## GUI（Tauri）: ドラッグ&ドロップでジョブ実行（MVP）
+## GUI（Tauri）: ジョブ実行（MVP）
 このGUIは **既存のDocker+CLIをそのまま使うジョブランナー** です。
 
 できること（MVP）:
 - 出力先（=ジョブルート）を選ぶ
-- 画像/PDF/フォルダをドラッグ&ドロップ（内部的に `input/` にコピー）
+- 画像/PDF/フォルダをファイルダイアログで追加（内部的に `input/` にコピー）
 - Startで `enqueue → run` を実行
-- `queue.sqlite3` を監視して進捗/ETA表示
+- `queue.sqlite3` を監視して進捗/推定残り時間を表示
 - 完了すると `output.md` がジョブルートに生成される
 
 ### 前提
@@ -137,7 +137,7 @@ npm run dev
 
 GUIの使い方:
 - 「Select output directory」を押して出力先フォルダを選択（ここがジョブルートになります）
-- 画像/PDF/フォルダをウィンドウにドラッグ&ドロップ
+- 「Add files」「Add folder」で入力を追加
 - 「Start OCR」で実行
 - 結果: `output.md`（中間: `output/`, キュー: `queue.sqlite3`, 入力コピー: `input/`）
 

@@ -23,6 +23,11 @@ DEFAULT_MARKDOWN_CONVERSION_PROMPT = "<image>\n<|grounding|>Convert the document
 # PDF rendering defaults (named to avoid magic numbers).
 DEFAULT_PDF_RENDER_DPI = 200
 
+# Markdown post-processing defaults.
+MATH_DELIMITER_STYLE_LATEX = "latex"  # Use \( \) and \[ \]
+MATH_DELIMITER_STYLE_DOLLAR = "dollar"  # Use $ and $$
+DEFAULT_MATH_DELIMITER_STYLE = MATH_DELIMITER_STYLE_DOLLAR
+
 
 @dataclass(frozen=True)
 class DeepSeekOcr2Settings:
@@ -35,12 +40,19 @@ class DeepSeekOcr2Settings:
 
     @staticmethod
     def from_environment() -> "DeepSeekOcr2Settings":
+        def decode_escaped_newlines(value: str) -> str:
+            # Guard: GUI passes prompts through environment variables where literal newlines are fragile.
+            # Support both actual newlines and escaped sequences like "\\n".
+            return value.replace("\\n", "\n")
+
         model_name = os.getenv("DEEPSEEK_OCR2_MODEL_NAME", DEFAULT_MODEL_NAME)
         model_revision_raw = os.getenv("DEEPSEEK_OCR2_MODEL_REVISION", "").strip()
         model_revision = model_revision_raw if model_revision_raw != "" else None
-        markdown_prompt = os.getenv(
+        markdown_prompt = decode_escaped_newlines(
+            os.getenv(
             "DEEPSEEK_OCR2_MARKDOWN_PROMPT",
             DEFAULT_MARKDOWN_CONVERSION_PROMPT,
+            )
         )
         base_image_size_pixels = int(
             os.getenv(
@@ -93,4 +105,19 @@ class RuntimePaths:
             work_directory_path=work_directory_path,
             per_task_markdown_directory_path=per_task_markdown_directory_path,
         )
+
+
+@dataclass(frozen=True)
+class MarkdownPostProcessingSettings:
+    math_delimiter_style: str
+
+    @staticmethod
+    def from_environment() -> "MarkdownPostProcessingSettings":
+        raw = os.getenv("OCR_AGENT_MATH_DELIMITER_STYLE", DEFAULT_MATH_DELIMITER_STYLE).strip()
+        normalized = raw.lower()
+        if normalized in {MATH_DELIMITER_STYLE_LATEX, MATH_DELIMITER_STYLE_DOLLAR}:
+            return MarkdownPostProcessingSettings(math_delimiter_style=normalized)
+
+        # Guard: Unknown value should fall back to a safe default.
+        return MarkdownPostProcessingSettings(math_delimiter_style=DEFAULT_MATH_DELIMITER_STYLE)
 

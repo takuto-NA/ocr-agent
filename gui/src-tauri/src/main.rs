@@ -20,8 +20,8 @@ use std::{
 };
 
 use rusqlite::Connection;
-use serde::Serialize;
-use tauri::{DragDropEvent, Emitter, State, Wry, WindowEvent};
+use serde::{Deserialize, Serialize};
+use tauri::{State, Wry};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::oneshot;
 use tauri_plugin_dialog::FilePath;
@@ -29,16 +29,56 @@ use tauri_plugin_dialog::FilePath;
 const DEFAULT_QUEUE_DATABASE_FILENAME: &str = "queue.sqlite3";
 const DEFAULT_INPUT_DIRECTORY_NAME: &str = "input";
 const DEFAULT_OUTPUT_DIRECTORY_NAME: &str = "output";
-const DEFAULT_OUTPUT_MARKDOWN_FILENAME: &str = "output.md";
+const DEFAULT_OUTPUT_MARKDOWN_FILENAME_EXTENSION: &str = ".md";
+const DEFAULT_OUTPUT_MARKDOWN_FILENAME_PREFIX: &str = "ocr_output_";
+
+const DEFAULT_JOB_SETTINGS_DIRECTORY_NAME: &str = ".ocr-agent";
+const DEFAULT_JOB_SETTINGS_FILENAME: &str = "job.json";
 
 const MAX_LOG_LINES: usize = 1500;
+const MAX_COPY_COLLISION_ATTEMPTS: u32 = 1000;
 const DOCKER_COMPOSE_SERVICE_NAME: &str = "ocr-agent";
 const OCR_AGENT_REPO_ROOT_ENVIRONMENT_VARIABLE_NAME: &str = "OCR_AGENT_REPO_ROOT";
+const MAX_PREVIEW_IMAGE_BYTES: u64 = 8_000_000;
 
-#[derive(Debug, Clone, Serialize)]
-struct DragDropPayload {
-  event: String,
-  paths: Vec<String>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct JobSettings {
+  output_markdown_filename_override: Option<String>,
+  last_output_markdown_filename: Option<String>,
+  is_math_delimiter_conversion_enabled: Option<bool>,
+  deepseek_ocr2_model_revision: Option<String>,
+  deepseek_ocr2_markdown_prompt: Option<String>,
+  deepseek_ocr2_base_image_size_pixels: Option<u32>,
+  deepseek_ocr2_inference_image_size_pixels: Option<u32>,
+  deepseek_ocr2_enable_crop_mode: Option<bool>,
+}
+
+fn job_settings_directory_path(job_root_directory_path: &Path) -> PathBuf {
+  job_root_directory_path.join(DEFAULT_JOB_SETTINGS_DIRECTORY_NAME)
+}
+
+fn job_settings_file_path(job_root_directory_path: &Path) -> PathBuf {
+  job_settings_directory_path(job_root_directory_path).join(DEFAULT_JOB_SETTINGS_FILENAME)
+}
+
+fn read_job_settings_best_effort(job_root_directory_path: &Path) -> JobSettings {
+  let settings_path = job_settings_file_path(job_root_directory_path);
+  if !settings_path.exists() {
+    return JobSettings::default();
+  }
+  let Ok(raw) = fs::read_to_string(&settings_path) else {
+    return JobSettings::default();
+  };
+  serde_json::from_str::<JobSettings>(&raw).unwrap_or_default()
+}
+
+fn write_job_settings(job_root_directory_path: &Path, settings: &JobSettings) -> Result<(), String> {
+  let settings_directory_path = job_settings_directory_path(job_root_directory_path);
+  fs::create_dir_all(&settings_directory_path).map_err(|error| error.to_string())?;
+  let settings_path = job_settings_file_path(job_root_directory_path);
+  let serialized = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
+  fs::write(settings_path, serialized).map_err(|error| error.to_string())?;
+  Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,12 +92,29 @@ struct JobStatus {
   completed_tasks: i64,
   failed_tasks: i64,
   last_error_message: Option<String>,
-  eta_seconds: Option<i64>,
+  estimated_time_remaining_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct JobLogResponse {
   lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurrentTaskPreview {
+  task_id: i64,
+  task_kind: String,
+  source_path: String,
+  pdf_page_index: Option<i64>,
+  pdf_total_pages: Option<i64>,
+  preview_image_file_path: Option<String>,
+  deepseek_inference_image_size_pixels: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PreviewImageBytes {
+  mime_type: String,
+  bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -99,6 +156,7 @@ fn ensure_job_directory_layout(job_root_directory_path: &Path) -> Result<(), Str
   let output_directory_path = job_root_directory_path.join(DEFAULT_OUTPUT_DIRECTORY_NAME);
   fs::create_dir_all(&input_directory_path).map_err(|error| error.to_string())?;
   fs::create_dir_all(&output_directory_path).map_err(|error| error.to_string())?;
+  fs::create_dir_all(job_settings_directory_path(job_root_directory_path)).map_err(|error| error.to_string())?;
   Ok(())
 }
 
@@ -344,6 +402,80 @@ fn sanitize_filename_for_copy(candidate_filename: &OsStr) -> String {
     .replace(':', "_")
 }
 
+fn split_filename_and_extension(filename: &str) -> (String, String) {
+  let Some(dot_index) = filename.rfind('.') else {
+    return (filename.to_string(), "".to_string());
+  };
+  if dot_index == 0 {
+    // Guard: hidden files like ".env" are treated as "no extension" for collision suffixing.
+    return (filename.to_string(), "".to_string());
+  }
+  let (stem, extension_with_dot) = filename.split_at(dot_index);
+  (stem.to_string(), extension_with_dot.to_string())
+}
+
+fn sanitize_output_markdown_filename(user_input: &str) -> String {
+  let trimmed = user_input.trim();
+  if trimmed.is_empty() {
+    // Guard: fallback to a stable base name when empty.
+    return "output".to_string();
+  }
+  let mut sanitized = trimmed.to_string();
+  sanitized = sanitized
+    .replace('\\', "_")
+    .replace('/', "_")
+    .replace(':', "_")
+    .replace('\n', "_")
+    .replace('\r', "_")
+    .replace('\t', "_")
+    .replace(' ', "_");
+  sanitized
+}
+
+fn ensure_markdown_extension(filename: &str) -> String {
+  let lower = filename.to_lowercase();
+  if lower.ends_with(".md") || lower.ends_with(".markdown") {
+    return filename.to_string();
+  }
+  format!("{filename}{DEFAULT_OUTPUT_MARKDOWN_FILENAME_EXTENSION}")
+}
+
+fn derive_non_conflicting_markdown_output_path(
+  job_root_directory_path: &Path,
+  desired_filename: &str,
+) -> Result<PathBuf, String> {
+  derive_non_conflicting_destination_path(job_root_directory_path, desired_filename)
+}
+
+fn derive_default_unique_markdown_filename() -> String {
+  // Guard: avoid collisions by embedding a timestamp.
+  format!("{DEFAULT_OUTPUT_MARKDOWN_FILENAME_PREFIX}{}.md", now_unix_timestamp_millis())
+}
+
+fn derive_non_conflicting_destination_path(
+  destination_directory_path: &Path,
+  desired_filename: &str,
+) -> Result<PathBuf, String> {
+  let desired_path = destination_directory_path.join(desired_filename);
+  if !desired_path.exists() {
+    return Ok(desired_path);
+  }
+
+  let (stem, extension_with_dot) = split_filename_and_extension(desired_filename);
+  for suffix_number in 2..=MAX_COPY_COLLISION_ATTEMPTS {
+    let candidate_filename = format!("{stem}_{suffix_number}{extension_with_dot}");
+    let candidate_path = destination_directory_path.join(candidate_filename);
+    if !candidate_path.exists() {
+      return Ok(candidate_path);
+    }
+  }
+
+  Err(format!(
+    "Too many name collisions while copying into: {} (base name: {desired_filename})",
+    destination_directory_path.display()
+  ))
+}
+
 fn copy_directory_recursively(source_directory_path: &Path, destination_directory_path: &Path) -> Result<u64, String> {
   if !source_directory_path.exists() {
     // Guard: do not silently ignore missing paths.
@@ -401,7 +533,7 @@ fn job_add_inputs(job_root_directory_path: String, input_paths: Vec<String>) -> 
         .map(sanitize_filename_for_copy)
         .unwrap_or_else(|| "input_file".to_string());
 
-      let destination_path = input_directory_path.join(file_name);
+      let destination_path = derive_non_conflicting_destination_path(&input_directory_path, &file_name)?;
       fs::copy(&input_path, &destination_path).map_err(|error| error.to_string())?;
       continue;
     }
@@ -412,7 +544,8 @@ fn job_add_inputs(job_root_directory_path: String, input_paths: Vec<String>) -> 
         .map(sanitize_filename_for_copy)
         .unwrap_or_else(|| "input_directory".to_string());
 
-      let destination_directory_path = input_directory_path.join(directory_name);
+      let destination_directory_path =
+        derive_non_conflicting_destination_path(&input_directory_path, &directory_name)?;
       let _ = copy_directory_recursively(&input_path, &destination_directory_path)?;
       continue;
     }
@@ -426,6 +559,88 @@ fn job_add_inputs(job_root_directory_path: String, input_paths: Vec<String>) -> 
 
 fn get_queue_database_path(job_root_directory_path: &Path) -> PathBuf {
   job_root_directory_path.join(DEFAULT_QUEUE_DATABASE_FILENAME)
+}
+
+fn query_current_running_task(queue_database_path: &Path) -> Result<Option<CurrentTaskPreview>, String> {
+  if !queue_database_path.exists() {
+    // Guard: queue might not exist until enqueue has run.
+    return Ok(None);
+  }
+
+  let connection = Connection::open(queue_database_path).map_err(|error| error.to_string())?;
+  let mut statement = connection
+    .prepare(
+      "SELECT task_id, task_kind, source_path, pdf_page_index, pdf_total_pages \
+       FROM tasks WHERE status = 'running' ORDER BY task_id ASC LIMIT 1",
+    )
+    .map_err(|error| error.to_string())?;
+  let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+  let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+    return Ok(None);
+  };
+
+  let task_id: i64 = row.get(0).map_err(|error| error.to_string())?;
+  let task_kind: String = row.get(1).map_err(|error| error.to_string())?;
+  let source_path: String = row.get(2).map_err(|error| error.to_string())?;
+  let pdf_page_index: Option<i64> = row.get(3).map_err(|error| error.to_string())?;
+  let pdf_total_pages: Option<i64> = row.get(4).map_err(|error| error.to_string())?;
+
+  Ok(Some(CurrentTaskPreview {
+    task_id,
+    task_kind,
+    source_path,
+    pdf_page_index,
+    pdf_total_pages,
+    preview_image_file_path: None,
+    deepseek_inference_image_size_pixels: None,
+  }))
+}
+
+fn resolve_preview_image_path_for_task(job_root_directory_path: &Path, task: &CurrentTaskPreview) -> Option<PathBuf> {
+  let task_kind_lower = task.task_kind.to_lowercase();
+  if task_kind_lower == "image" {
+    if let Some(relative) = task.source_path.strip_prefix("/data/input/") {
+      return Some(job_root_directory_path.join(DEFAULT_INPUT_DIRECTORY_NAME).join(relative));
+    }
+    return Some(PathBuf::from(&task.source_path));
+  }
+
+  if task_kind_lower != "pdf_page" {
+    return None;
+  }
+  let pdf_page_index = task.pdf_page_index?;
+  let page_number_human = pdf_page_index + 1;
+  let work_directory_path = job_root_directory_path
+    .join(DEFAULT_OUTPUT_DIRECTORY_NAME)
+    .join("work");
+  Some(work_directory_path.join(format!(
+    "pdf_{}_page_{}.png",
+    task.task_id, page_number_human
+  )))
+}
+
+fn infer_image_mime_type(image_file_path: &Path) -> String {
+  let extension = image_file_path
+    .extension()
+    .and_then(|ext| ext.to_str())
+    .unwrap_or("")
+    .to_lowercase();
+  if extension == "png" {
+    return "image/png".to_string();
+  }
+  if extension == "jpg" || extension == "jpeg" {
+    return "image/jpeg".to_string();
+  }
+  if extension == "webp" {
+    return "image/webp".to_string();
+  }
+  if extension == "bmp" {
+    return "image/bmp".to_string();
+  }
+  if extension == "gif" {
+    return "image/gif".to_string();
+  }
+  "application/octet-stream".to_string()
 }
 
 fn query_status_counts(queue_database_path: &Path) -> Result<HashMap<String, i64>, String> {
@@ -470,7 +685,7 @@ fn query_last_error_message(queue_database_path: &Path) -> Result<Option<String>
   Ok(Some(error_message))
 }
 
-fn compute_eta_seconds(
+fn compute_estimated_time_remaining_seconds(
   start_unix_timestamp_millis: Option<i64>,
   total_tasks: i64,
   completed_tasks: i64,
@@ -525,7 +740,11 @@ fn get_job_status(
     }
   };
 
-  let eta_seconds = compute_eta_seconds(start_unix_timestamp_millis, total_tasks, completed_tasks);
+  let estimated_time_remaining_seconds = compute_estimated_time_remaining_seconds(
+    start_unix_timestamp_millis,
+    total_tasks,
+    completed_tasks,
+  );
   let last_error_message = query_last_error_message(&queue_database_path)?;
 
   Ok(JobStatus {
@@ -538,7 +757,7 @@ fn get_job_status(
     completed_tasks,
     failed_tasks,
     last_error_message,
-    eta_seconds,
+    estimated_time_remaining_seconds,
   })
 }
 
@@ -590,12 +809,71 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
   let mut command = build_docker_compose_base_command(&repo_root);
   command.arg("run");
   command.arg("--rm");
+  let settings = read_job_settings_best_effort(&job_root_directory_path);
+
+  let is_math_delimiter_conversion_enabled = settings.is_math_delimiter_conversion_enabled.unwrap_or(true);
+  let math_delimiter_style = if is_math_delimiter_conversion_enabled {
+    "dollar"
+  } else {
+    "latex"
+  };
+  command.arg("-e");
+  command.arg(format!("OCR_AGENT_MATH_DELIMITER_STYLE={math_delimiter_style}"));
+
+  if let Some(model_revision) = settings.deepseek_ocr2_model_revision.as_deref() {
+    let trimmed = model_revision.trim();
+    if !trimmed.is_empty() {
+      command.arg("-e");
+      command.arg(format!("DEEPSEEK_OCR2_MODEL_REVISION={trimmed}"));
+    }
+  }
+  if let Some(markdown_prompt) = settings.deepseek_ocr2_markdown_prompt.as_deref() {
+    let encoded_prompt = markdown_prompt.replace("\r\n", "\n").replace('\n', "\\n");
+    command.arg("-e");
+    command.arg(format!("DEEPSEEK_OCR2_MARKDOWN_PROMPT={encoded_prompt}"));
+  }
+  if let Some(base_size_pixels) = settings.deepseek_ocr2_base_image_size_pixels {
+    command.arg("-e");
+    command.arg(format!("DEEPSEEK_OCR2_BASE_IMAGE_SIZE_PIXELS={base_size_pixels}"));
+  }
+  if let Some(image_size_pixels) = settings.deepseek_ocr2_inference_image_size_pixels {
+    command.arg("-e");
+    command.arg(format!("DEEPSEEK_OCR2_INFERENCE_IMAGE_SIZE_PIXELS={image_size_pixels}"));
+  }
+  if let Some(enable_crop_mode) = settings.deepseek_ocr2_enable_crop_mode {
+    command.arg("-e");
+    command.arg(format!(
+      "DEEPSEEK_OCR2_ENABLE_CROP_MODE={}",
+      if enable_crop_mode { "1" } else { "0" }
+    ));
+  }
+
   command.arg("-v");
   command.arg(format!("{job_root_for_docker}:/data"));
   command.arg(DOCKER_COMPOSE_SERVICE_NAME);
   command.arg("bash");
   command.arg("-lc");
-  command.arg("python3 -m ocr_agent.cli enqueue /data/input && python3 -m ocr_agent.cli run --output-md /data/output.md");
+  let desired_output_filename = match settings.output_markdown_filename_override.as_deref() {
+    None => derive_default_unique_markdown_filename(),
+    Some(filename) => ensure_markdown_extension(&sanitize_output_markdown_filename(filename)),
+  };
+  let output_markdown_path = derive_non_conflicting_markdown_output_path(
+    &job_root_directory_path,
+    &desired_output_filename,
+  )?;
+  let output_markdown_filename = output_markdown_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .ok_or_else(|| "Failed to derive output markdown filename".to_string())?
+    .to_string();
+
+  let mut updated_settings = settings.clone();
+  updated_settings.last_output_markdown_filename = Some(output_markdown_filename.clone());
+  write_job_settings(&job_root_directory_path, &updated_settings)?;
+
+  command.arg(format!(
+    "python3 -m ocr_agent.cli enqueue /data/input && python3 -m ocr_agent.cli run --output-md \"/data/{output_markdown_filename}\""
+  ));
   command.stdout(Stdio::piped());
   command.stderr(Stdio::piped());
 
@@ -682,7 +960,17 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
 }
 
 #[tauri::command]
-fn run_job(job_root_directory_path: String, job_runtime_state: State<'_, SharedJobRuntimeState>) -> Result<(), String> {
+fn run_job(
+  job_root_directory_path: String,
+  output_markdown_filename_override: Option<String>,
+  is_math_delimiter_conversion_enabled: Option<bool>,
+  deepseek_ocr2_model_revision: Option<String>,
+  deepseek_ocr2_markdown_prompt: Option<String>,
+  deepseek_ocr2_base_image_size_pixels: Option<u32>,
+  deepseek_ocr2_inference_image_size_pixels: Option<u32>,
+  deepseek_ocr2_enable_crop_mode: Option<bool>,
+  job_runtime_state: State<'_, SharedJobRuntimeState>,
+) -> Result<(), String> {
   validate_docker_available()?;
 
   let job_root_directory_path = PathBuf::from(job_root_directory_path);
@@ -697,6 +985,40 @@ fn run_job(job_root_directory_path: String, job_runtime_state: State<'_, SharedJ
     // Guard: prevent a confusing no-op run.
     return Err("No input files found under input/. Drop images or PDFs first.".to_string());
   }
+
+  let mut settings = read_job_settings_best_effort(&job_root_directory_path);
+  let override_candidate = output_markdown_filename_override
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+  if override_candidate.is_empty() {
+    settings.output_markdown_filename_override = None;
+  } else {
+    settings.output_markdown_filename_override = Some(override_candidate);
+  }
+  settings.is_math_delimiter_conversion_enabled = is_math_delimiter_conversion_enabled;
+
+  settings.deepseek_ocr2_model_revision = deepseek_ocr2_model_revision;
+  settings.deepseek_ocr2_markdown_prompt = deepseek_ocr2_markdown_prompt;
+
+  if let Some(base_image_size_pixels) = deepseek_ocr2_base_image_size_pixels {
+    if base_image_size_pixels <= 0 {
+      // Guard: reject invalid sizes early.
+      return Err("deepseek_ocr2_base_image_size_pixels must be > 0".to_string());
+    }
+    settings.deepseek_ocr2_base_image_size_pixels = Some(base_image_size_pixels);
+  }
+
+  if let Some(inference_image_size_pixels) = deepseek_ocr2_inference_image_size_pixels {
+    if inference_image_size_pixels <= 0 {
+      // Guard: reject invalid sizes early.
+      return Err("deepseek_ocr2_inference_image_size_pixels must be > 0".to_string());
+    }
+    settings.deepseek_ocr2_inference_image_size_pixels = Some(inference_image_size_pixels);
+  }
+
+  settings.deepseek_ocr2_enable_crop_mode = deepseek_ocr2_enable_crop_mode;
+  write_job_settings(&job_root_directory_path, &settings)?;
 
   spawn_job_process(job_runtime_state.inner().clone(), job_root_directory_path)?;
   Ok(())
@@ -739,19 +1061,85 @@ fn get_job_logs(job_root_directory_path: String, job_runtime_state: State<'_, Sh
 }
 
 #[tauri::command]
+fn get_current_task_preview(job_root_directory_path: String) -> Result<Option<CurrentTaskPreview>, String> {
+  let job_root_directory_path = PathBuf::from(job_root_directory_path);
+  ensure_job_directory_layout(&job_root_directory_path)?;
+
+  let queue_database_path = get_queue_database_path(&job_root_directory_path);
+  let Some(mut running_task) = query_current_running_task(&queue_database_path)? else {
+    return Ok(None);
+  };
+
+  let settings = read_job_settings_best_effort(&job_root_directory_path);
+  running_task.deepseek_inference_image_size_pixels = settings.deepseek_ocr2_inference_image_size_pixels;
+
+  let preview_path = resolve_preview_image_path_for_task(&job_root_directory_path, &running_task);
+  if let Some(preview_path) = preview_path {
+    if preview_path.exists() {
+      running_task.preview_image_file_path = Some(preview_path.to_string_lossy().to_string());
+    } else {
+      running_task.preview_image_file_path = Some(preview_path.to_string_lossy().to_string());
+    }
+  }
+
+  Ok(Some(running_task))
+}
+
+#[tauri::command]
+fn get_current_task_preview_image_bytes(job_root_directory_path: String) -> Result<Option<PreviewImageBytes>, String> {
+  let job_root_directory_path = PathBuf::from(job_root_directory_path);
+  ensure_job_directory_layout(&job_root_directory_path)?;
+
+  let queue_database_path = get_queue_database_path(&job_root_directory_path);
+  let Some(running_task) = query_current_running_task(&queue_database_path)? else {
+    return Ok(None);
+  };
+  let Some(image_path) = resolve_preview_image_path_for_task(&job_root_directory_path, &running_task) else {
+    return Ok(None);
+  };
+  if !image_path.exists() {
+    // Guard: preview can lag behind rendering; treat missing as "not ready".
+    return Ok(None);
+  }
+  let metadata = fs::metadata(&image_path).map_err(|error| error.to_string())?;
+  if !metadata.is_file() {
+    // Guard: refuse non-files for preview reads.
+    return Ok(None);
+  }
+  if metadata.len() > MAX_PREVIEW_IMAGE_BYTES {
+    return Err(format!(
+      "Preview image is too large to load in GUI ({} bytes).",
+      metadata.len()
+    ));
+  }
+
+  let bytes = fs::read(&image_path).map_err(|error| error.to_string())?;
+  Ok(Some(PreviewImageBytes {
+    mime_type: infer_image_mime_type(&image_path),
+    bytes,
+  }))
+}
+
+#[tauri::command]
 fn reset_job_directory(job_root_directory_path: String) -> Result<(), String> {
   let job_root_directory_path = PathBuf::from(job_root_directory_path);
   ensure_job_directory_layout(&job_root_directory_path)?;
 
   let queue_database_path = get_queue_database_path(&job_root_directory_path);
   let output_directory_path = job_root_directory_path.join(DEFAULT_OUTPUT_DIRECTORY_NAME);
-  let output_markdown_path = job_root_directory_path.join(DEFAULT_OUTPUT_MARKDOWN_FILENAME);
+  let settings = read_job_settings_best_effort(&job_root_directory_path);
+  let output_markdown_path = settings
+    .last_output_markdown_filename
+    .as_deref()
+    .map(|filename| job_root_directory_path.join(filename));
 
   if queue_database_path.exists() {
     fs::remove_file(queue_database_path).map_err(|error| error.to_string())?;
   }
-  if output_markdown_path.exists() {
-    fs::remove_file(output_markdown_path).map_err(|error| error.to_string())?;
+  if let Some(output_markdown_path) = output_markdown_path {
+    if output_markdown_path.exists() {
+      fs::remove_file(output_markdown_path).map_err(|error| error.to_string())?;
+    }
   }
   if output_directory_path.exists() && output_directory_path.is_dir() {
     fs::remove_dir_all(output_directory_path).map_err(|error| error.to_string())?;
@@ -802,43 +1190,6 @@ fn main() {
   let job_runtime_state: SharedJobRuntimeState = Arc::new(Mutex::new(JobRuntimeState::default()));
 
   tauri::Builder::default()
-    .on_window_event(|window, event| {
-      let WindowEvent::DragDrop(drag_event) = event else {
-        return;
-      };
-
-      match drag_event {
-        DragDropEvent::Enter { paths, .. } => {
-          let _ = window.emit(
-            "ocr_drag_drop",
-            DragDropPayload {
-              event: "enter".to_string(),
-              paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
-            },
-          );
-        }
-        DragDropEvent::Over { .. } => {}
-        DragDropEvent::Drop { paths, .. } => {
-          let _ = window.emit(
-            "ocr_drag_drop",
-            DragDropPayload {
-              event: "drop".to_string(),
-              paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
-            },
-          );
-        }
-        DragDropEvent::Leave => {
-          let _ = window.emit(
-            "ocr_drag_drop",
-            DragDropPayload {
-              event: "leave".to_string(),
-              paths: Vec::new(),
-            },
-          );
-        }
-        _ => {}
-      }
-    })
     .plugin(tauri_plugin_dialog::init())
     .manage(job_runtime_state)
     .invoke_handler(tauri::generate_handler![
@@ -850,6 +1201,8 @@ fn main() {
       job_add_inputs,
       get_job_status,
       get_job_logs,
+      get_current_task_preview,
+      get_current_task_preview_image_bytes,
       run_job,
       cancel_job,
       reset_job_directory,
