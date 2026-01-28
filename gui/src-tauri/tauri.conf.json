@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run frontend:dev",
     "beforeBuildCommand": "npm run frontend:build",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1421",
     "frontendDist": "../dist"
   },
   "app": {
@@ -15,7 +15,8 @@
         "title": "ocr-agent",
         "width": 980,
         "height": 760,
-        "resizable": true
+        "resizable": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {

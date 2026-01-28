@@ -21,8 +21,10 @@ use std::{
 
 use rusqlite::Connection;
 use serde::Serialize;
-use tauri::{State, Wry};
+use tauri::{DragDropEvent, Emitter, State, Wry, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::oneshot;
+use tauri_plugin_dialog::FilePath;
 
 const DEFAULT_QUEUE_DATABASE_FILENAME: &str = "queue.sqlite3";
 const DEFAULT_INPUT_DIRECTORY_NAME: &str = "input";
@@ -32,6 +34,12 @@ const DEFAULT_OUTPUT_MARKDOWN_FILENAME: &str = "output.md";
 const MAX_LOG_LINES: usize = 1500;
 const DOCKER_COMPOSE_SERVICE_NAME: &str = "ocr-agent";
 const OCR_AGENT_REPO_ROOT_ENVIRONMENT_VARIABLE_NAME: &str = "OCR_AGENT_REPO_ROOT";
+
+#[derive(Debug, Clone, Serialize)]
+struct DragDropPayload {
+  event: String,
+  paths: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct JobStatus {
@@ -53,15 +61,14 @@ struct JobLogResponse {
 }
 
 #[derive(Debug)]
-struct RunningJobProcess {
-  job_root_directory_path: PathBuf,
-  child: Child,
+struct RunningJobHandle {
+  child: Arc<Mutex<Child>>,
   start_unix_timestamp_millis: i64,
 }
 
 #[derive(Default)]
 struct JobRuntimeState {
-  running_job_by_root: HashMap<PathBuf, RunningJobProcess>,
+  running_job_by_root: HashMap<PathBuf, RunningJobHandle>,
   log_lines_by_root: HashMap<PathBuf, VecDeque<String>>,
 }
 
@@ -95,6 +102,33 @@ fn ensure_job_directory_layout(job_root_directory_path: &Path) -> Result<(), Str
   Ok(())
 }
 
+fn normalize_windows_path_lossy(path: &Path) -> String {
+  let raw = path.to_string_lossy().to_string();
+  if !cfg!(target_os = "windows") {
+    return raw;
+  }
+
+  // Guard: std::fs::canonicalize can yield verbatim paths like \\?\C:\... which Docker can't parse in volume specs.
+  if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+    if let Some(unc_stripped) = stripped.strip_prefix(r"UNC\") {
+      return format!(r"\\{}", unc_stripped);
+    }
+    return stripped.to_string();
+  }
+  raw
+}
+
+fn normalize_windows_path_buf(path: &Path) -> PathBuf {
+  PathBuf::from(normalize_windows_path_lossy(path))
+}
+
+fn file_path_to_string(file_path: FilePath) -> String {
+  match file_path {
+    FilePath::Path(path) => path.to_string_lossy().to_string(),
+    FilePath::Url(url) => url.to_string(),
+  }
+}
+
 fn repo_root_path() -> Result<PathBuf, String> {
   if let Ok(configured_repo_root) = std::env::var(OCR_AGENT_REPO_ROOT_ENVIRONMENT_VARIABLE_NAME) {
     let configured_repo_root = configured_repo_root.trim().to_string();
@@ -105,9 +139,10 @@ fn repo_root_path() -> Result<PathBuf, String> {
       ));
     }
     let configured_path = PathBuf::from(configured_repo_root);
-    return configured_path
+    let canonical = configured_path
       .canonicalize()
-      .map_err(|error| format!("Failed to canonicalize OCR_AGENT_REPO_ROOT: {error}"));
+      .map_err(|error| format!("Failed to canonicalize OCR_AGENT_REPO_ROOT: {error}"))?;
+    return Ok(normalize_windows_path_buf(&canonical));
   }
 
   let manifest_directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -115,9 +150,10 @@ fn repo_root_path() -> Result<PathBuf, String> {
     .parent()
     .and_then(|path| path.parent())
     .ok_or_else(|| "Failed to infer repo root from CARGO_MANIFEST_DIR".to_string())?;
-  repo_root_candidate
+  let canonical = repo_root_candidate
     .canonicalize()
-    .map_err(|error| format!("Failed to canonicalize repo root: {error}"))
+    .map_err(|error| format!("Failed to canonicalize repo root: {error}"))?;
+  Ok(normalize_windows_path_buf(&canonical))
 }
 
 fn compose_file_path(repo_root: &Path) -> PathBuf {
@@ -132,6 +168,21 @@ fn build_docker_compose_base_command(repo_root: &Path) -> Command {
   command.arg("--project-directory");
   command.arg(repo_root);
   command
+}
+
+fn derive_compose_project_name(repo_root: &Path) -> String {
+  repo_root
+    .file_name()
+    .and_then(|name| name.to_str())
+    .map(|name| name.to_string())
+    .unwrap_or_else(|| "ocr-agent".to_string())
+}
+
+fn derive_compose_service_image_name(repo_root: &Path, service_name: &str) -> String {
+  // Compose default: {project}-{service}:latest
+  // Example for this repo: ocr-agent-ocr-agent:latest
+  let project_name = derive_compose_project_name(repo_root);
+  format!("{project_name}-{service_name}:latest")
 }
 
 fn validate_docker_available() -> Result<(), String> {
@@ -177,23 +228,24 @@ fn probe_docker() -> Result<(), String> {
   }
 
   // Guard: give a fast, actionable error if the image isn't built yet.
-  let image_check_output = build_docker_compose_base_command(&repo_root)
-    .arg("images")
-    .arg("-q")
-    .arg(DOCKER_COMPOSE_SERVICE_NAME)
-    .stdout(Stdio::piped())
+  // NOTE:
+  // `docker compose images` can return an empty list unless containers were created, so we instead
+  // check the derived image name Compose uses by default.
+  let derived_image_name = derive_compose_service_image_name(&repo_root, DOCKER_COMPOSE_SERVICE_NAME);
+  let inspect_output = Command::new("docker")
+    .arg("image")
+    .arg("inspect")
+    .arg(&derived_image_name)
+    .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .output();
 
-  if let Ok(image_check_output) = image_check_output {
-    if image_check_output.status.success() {
-      let image_id = String::from_utf8_lossy(&image_check_output.stdout).trim().to_string();
-      if image_id.is_empty() {
-        return Err(format!(
-          "Docker image for `{DOCKER_COMPOSE_SERVICE_NAME}` is not built.\nRun: docker compose -f \"{}\" build",
-          compose_path.display()
-        ));
-      }
+  if let Ok(inspect_output) = inspect_output {
+    if !inspect_output.status.success() {
+      return Err(format!(
+        "Docker image for `{DOCKER_COMPOSE_SERVICE_NAME}` is not built.\nExpected image: {derived_image_name}\nRun: docker compose -f \"{}\" build",
+        compose_path.display()
+      ));
     }
   }
 
@@ -226,17 +278,58 @@ fn probe_gpu_passthrough() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn pick_output_directory(app_handle: tauri::AppHandle<Wry>) -> Result<Option<String>, String> {
-  let selected_directory_path = app_handle
-    .dialog()
-    .file()
-    .pick_folder()
-    .map_err(|error| error.to_string())?;
+async fn pick_output_directory(app_handle: tauri::AppHandle<Wry>) -> Result<Option<String>, String> {
+  let (sender, receiver) = oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+  app_handle.dialog().file().pick_folder(move |path| {
+    // Guard: receiver side may be dropped if the request is cancelled.
+    let _ = sender.send(path);
+  });
+
+  let selected_directory_path = receiver
+    .await
+    .map_err(|_| "Failed to receive folder picker result".to_string())?;
 
   let Some(directory_path) = selected_directory_path else {
     return Ok(None);
   };
-  Ok(Some(directory_path.to_string_lossy().to_string()))
+
+  Ok(Some(file_path_to_string(directory_path)))
+}
+
+#[tauri::command]
+async fn pick_input_files(app_handle: tauri::AppHandle<Wry>) -> Result<Option<Vec<String>>, String> {
+  let (sender, receiver) = oneshot::channel::<Option<Vec<FilePath>>>();
+  app_handle.dialog().file().pick_files(move |paths| {
+    // Guard: receiver side may be dropped if the request is cancelled.
+    let _ = sender.send(paths);
+  });
+
+  let selected_paths = receiver
+    .await
+    .map_err(|_| "Failed to receive file picker result".to_string())?;
+
+  let Some(selected_paths) = selected_paths else {
+    return Ok(None);
+  };
+  Ok(Some(selected_paths.into_iter().map(file_path_to_string).collect()))
+}
+
+#[tauri::command]
+async fn pick_input_folder(app_handle: tauri::AppHandle<Wry>) -> Result<Option<String>, String> {
+  let (sender, receiver) = oneshot::channel::<Option<FilePath>>();
+  app_handle.dialog().file().pick_folder(move |path| {
+    // Guard: receiver side may be dropped if the request is cancelled.
+    let _ = sender.send(path);
+  });
+
+  let selected_path = receiver
+    .await
+    .map_err(|_| "Failed to receive folder picker result".to_string())?;
+
+  let Some(selected_path) = selected_path else {
+    return Ok(None);
+  };
+  Ok(Some(file_path_to_string(selected_path)))
 }
 
 fn sanitize_filename_for_copy(candidate_filename: &OsStr) -> String {
@@ -425,10 +518,10 @@ fn get_job_status(
 
   let (is_running, start_unix_timestamp_millis) = {
     let locked_state = job_runtime_state.lock().map_err(|_| "State lock poisoned".to_string())?;
-    let running_process = locked_state.running_job_by_root.get(&job_root_directory_path);
-    match running_process {
+    let running_handle = locked_state.running_job_by_root.get(&job_root_directory_path);
+    match running_handle {
       None => (false, None),
-      Some(process) => (true, Some(process.start_unix_timestamp_millis)),
+      Some(handle) => (true, Some(handle.start_unix_timestamp_millis)),
     }
   };
 
@@ -491,13 +584,14 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
   let job_root_canonical = job_root_directory_path
     .canonicalize()
     .map_err(|error| format!("Failed to canonicalize job root: {error}"))?;
+  let job_root_for_docker = normalize_windows_path_lossy(&job_root_canonical);
 
   // NOTE: We cannot rely on shell operators without invoking a shell. Use `bash -lc` inside container.
   let mut command = build_docker_compose_base_command(&repo_root);
   command.arg("run");
   command.arg("--rm");
   command.arg("-v");
-  command.arg(format!("{}:/data", job_root_canonical.display()));
+  command.arg(format!("{job_root_for_docker}:/data"));
   command.arg(DOCKER_COMPOSE_SERVICE_NAME);
   command.arg("bash");
   command.arg("-lc");
@@ -515,6 +609,7 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
   let stderr = child.stderr.take();
 
   let start_unix_timestamp_millis = now_unix_timestamp_millis();
+  let child_handle = Arc::new(Mutex::new(child));
 
   {
     let mut locked_state = job_runtime_state.lock().map_err(|_| "State lock poisoned".to_string())?;
@@ -524,9 +619,8 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
     }
     locked_state.running_job_by_root.insert(
       job_root_directory_path.clone(),
-      RunningJobProcess {
-        job_root_directory_path: job_root_directory_path.clone(),
-        child,
+      RunningJobHandle {
+        child: child_handle.clone(),
         start_unix_timestamp_millis,
       },
     );
@@ -544,42 +638,44 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
   }
 
   // Waiter thread: removes running state once done.
+  let waiter_state = job_runtime_state.clone();
+  let waiter_job_root = job_root_directory_path.clone();
+  let waiter_child_handle = child_handle.clone();
   std::thread::spawn(move || {
+    // IMPORTANT: Never hold the global runtime-state lock while waiting on the child process.
+    // Otherwise, all status/log polling will block and the UI appears frozen.
     let exit_status_result = {
-      let mut locked_state = match job_runtime_state.lock() {
-        Ok(state) => state,
+      let mut child_guard = match waiter_child_handle.lock() {
+        Ok(guard) => guard,
         Err(_) => return,
       };
-      let Some(running) = locked_state.running_job_by_root.get_mut(&job_root_directory_path) else {
-        return;
-      };
-      running.child.wait()
+      child_guard.wait()
     };
 
     let exit_status = match exit_status_result {
       Ok(status) => status,
       Err(error) => {
-        append_log_line(&job_runtime_state, &job_root_directory_path, format!("[backend] wait error: {error}"));
-        let mut locked_state = match job_runtime_state.lock() {
+        append_log_line(&waiter_state, &waiter_job_root, format!("[backend] wait error: {error}"));
+        let mut locked_state = match waiter_state.lock() {
           Ok(state) => state,
           Err(_) => return,
         };
-        locked_state.running_job_by_root.remove(&job_root_directory_path);
+        locked_state.running_job_by_root.remove(&waiter_job_root);
         return;
       }
     };
 
     append_log_line(
-      &job_runtime_state,
-      &job_root_directory_path,
+      &waiter_state,
+      &waiter_job_root,
       format!("[backend] finished: {exit_status}"),
     );
 
-    let mut locked_state = match job_runtime_state.lock() {
+    let mut locked_state = match waiter_state.lock() {
       Ok(state) => state,
       Err(_) => return,
     };
-    locked_state.running_job_by_root.remove(&job_root_directory_path);
+    locked_state.running_job_by_root.remove(&waiter_job_root);
   });
 
   Ok(())
@@ -609,15 +705,22 @@ fn run_job(job_root_directory_path: String, job_runtime_state: State<'_, SharedJ
 #[tauri::command]
 fn cancel_job(job_root_directory_path: String, job_runtime_state: State<'_, SharedJobRuntimeState>) -> Result<(), String> {
   let job_root_directory_path = PathBuf::from(job_root_directory_path);
-  let mut locked_state = job_runtime_state.lock().map_err(|_| "State lock poisoned".to_string())?;
-
-  let Some(running) = locked_state.running_job_by_root.get_mut(&job_root_directory_path) else {
-    // Guard: nothing to cancel.
-    return Ok(());
+  let child_handle = {
+    let locked_state = job_runtime_state.lock().map_err(|_| "State lock poisoned".to_string())?;
+    let Some(running) = locked_state.running_job_by_root.get(&job_root_directory_path) else {
+      // Guard: nothing to cancel.
+      return Ok(());
+    };
+    running.child.clone()
   };
 
-  running.child.kill().map_err(|error| error.to_string())?;
-  append_log_line(job_runtime_state.inner(), &job_root_directory_path, "[backend] cancellation requested".to_string());
+  let mut child_guard = child_handle.lock().map_err(|_| "Child lock poisoned".to_string())?;
+  child_guard.kill().map_err(|error| error.to_string())?;
+  append_log_line(
+    job_runtime_state.inner(),
+    &job_root_directory_path,
+    "[backend] cancellation requested".to_string(),
+  );
   Ok(())
 }
 
@@ -699,12 +802,51 @@ fn main() {
   let job_runtime_state: SharedJobRuntimeState = Arc::new(Mutex::new(JobRuntimeState::default()));
 
   tauri::Builder::default()
+    .on_window_event(|window, event| {
+      let WindowEvent::DragDrop(drag_event) = event else {
+        return;
+      };
+
+      match drag_event {
+        DragDropEvent::Enter { paths, .. } => {
+          let _ = window.emit(
+            "ocr_drag_drop",
+            DragDropPayload {
+              event: "enter".to_string(),
+              paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            },
+          );
+        }
+        DragDropEvent::Over { .. } => {}
+        DragDropEvent::Drop { paths, .. } => {
+          let _ = window.emit(
+            "ocr_drag_drop",
+            DragDropPayload {
+              event: "drop".to_string(),
+              paths: paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            },
+          );
+        }
+        DragDropEvent::Leave => {
+          let _ = window.emit(
+            "ocr_drag_drop",
+            DragDropPayload {
+              event: "leave".to_string(),
+              paths: Vec::new(),
+            },
+          );
+        }
+        _ => {}
+      }
+    })
     .plugin(tauri_plugin_dialog::init())
     .manage(job_runtime_state)
     .invoke_handler(tauri::generate_handler![
       probe_docker,
       probe_gpu_passthrough,
       pick_output_directory,
+      pick_input_files,
+      pick_input_folder,
       job_add_inputs,
       get_job_status,
       get_job_logs,

@@ -19,7 +19,10 @@ def get_pdf_total_pages(pdf_file_path: Path) -> int:
         raise FileNotFoundError(str(pdf_file_path))
 
     pdf_document = pdfium.PdfDocument(str(pdf_file_path))
-    return int(len(pdf_document))
+    try:
+        return int(len(pdf_document))
+    finally:
+        _close_pdfium_object_safely(pdf_document)
 
 
 def render_pdf_page_to_image_file(
@@ -40,17 +43,36 @@ def render_pdf_page_to_image_file(
     output_image_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     pdf_document = pdfium.PdfDocument(str(pdf_file_path))
-    pdf_total_pages = int(len(pdf_document))
-    if pdf_page_index >= pdf_total_pages:
-        # Guard: Page index must be in range.
-        raise ValueError("pdf_page_index is out of range")
+    pdf_page = None
+    renderer = None
+    try:
+        pdf_total_pages = int(len(pdf_document))
+        if pdf_page_index >= pdf_total_pages:
+            # Guard: Page index must be in range.
+            raise ValueError("pdf_page_index is out of range")
 
-    pdf_page = pdf_document[pdf_page_index]
-    renderer = pdf_page.render(scale=_dots_per_inch_to_scale(render_dots_per_inch))
-    pil_image: Image.Image = renderer.to_pil()
-    pil_image.save(output_image_file_path)
+        pdf_page = pdf_document[pdf_page_index]
+        renderer = pdf_page.render(scale=_dots_per_inch_to_scale(render_dots_per_inch))
+        pil_image: Image.Image = renderer.to_pil()
+        pil_image.save(output_image_file_path)
+        return output_image_file_path
+    finally:
+        _close_pdfium_object_safely(renderer)
+        _close_pdfium_object_safely(pdf_page)
+        _close_pdfium_object_safely(pdf_document)
 
-    return output_image_file_path
+
+def _close_pdfium_object_safely(pdfium_object: object) -> None:
+    if pdfium_object is None:
+        return
+    close_method = getattr(pdfium_object, "close", None)
+    if close_method is None:
+        return
+    try:
+        close_method()
+    except Exception:
+        # Guard: best-effort cleanup to reduce noisy shutdown warnings.
+        return
 
 
 def _dots_per_inch_to_scale(dots_per_inch: int) -> float:

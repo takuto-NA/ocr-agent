@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+import time
 from typing import Iterable
 
 
@@ -19,6 +20,10 @@ TASK_STATUS_FAILED = "failed"
 
 TASK_KIND_IMAGE = "image"
 TASK_KIND_PDF_PAGE = "pdf_page"
+
+DEFAULT_SQLITE_CONNECT_TIMEOUT_SECONDS = 30.0
+DEFAULT_SQLITE_CONNECT_MAX_RETRIES = 5
+DEFAULT_SQLITE_CONNECT_RETRY_SLEEP_SECONDS = 0.4
 
 
 @dataclass(frozen=True)
@@ -198,9 +203,28 @@ class QueueStore:
         return deleted_rows_count
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self._queue_database_path))
-        connection.row_factory = sqlite3.Row
-        return connection
+        last_exception: Exception | None = None
+        for attempt_index in range(DEFAULT_SQLITE_CONNECT_MAX_RETRIES):
+            try:
+                connection = sqlite3.connect(
+                    str(self._queue_database_path),
+                    timeout=DEFAULT_SQLITE_CONNECT_TIMEOUT_SECONDS,
+                )
+                connection.row_factory = sqlite3.Row
+                return connection
+            except sqlite3.OperationalError as exception:
+                last_exception = exception
+                # Guard: Windows bind mounts can transiently fail with "disk I/O error".
+                # Retrying avoids flaky first-run failures.
+                if "disk I/O error" not in str(exception):
+                    raise
+                if attempt_index >= DEFAULT_SQLITE_CONNECT_MAX_RETRIES - 1:
+                    raise
+                time.sleep(DEFAULT_SQLITE_CONNECT_RETRY_SLEEP_SECONDS)
+
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError("Failed to connect to SQLite queue database")
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row | None) -> QueueTask | None:

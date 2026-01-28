@@ -7,8 +7,8 @@
  *   - Poll progress (counts + ETA) and show logs
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { isTauriWebview } from "./tauri_env";
 
 type JobStatus = {
   job_root_directory_path: string;
@@ -29,6 +29,7 @@ type JobLogResponse = {
 
 const PROGRESS_POLL_INTERVAL_MILLIS = 900;
 const LOG_POLL_INTERVAL_MILLIS = 700;
+const MAX_UI_LOG_LINES = 400;
 
 function formatSecondsHuman(totalSeconds: number): string {
   const safeSeconds = Math.max(0, Math.floor(totalSeconds));
@@ -41,11 +42,13 @@ function formatSecondsHuman(totalSeconds: number): string {
 }
 
 export function App() {
+  const isRunningInsideTauri = useMemo(() => isTauriWebview(), []);
   const [jobRootDirectoryPath, setJobRootDirectoryPath] = useState<string | null>(null);
   const [droppedPathCount, setDroppedPathCount] = useState<number>(0);
-  const [isDragging, setIsDragging] = useState<boolean>(false);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
-  const [logLines, setLogLines] = useState<string[]>([]);
+  const [isStartingRun, setIsStartingRun] = useState<boolean>(false);
+  const [uiLogLines, setUiLogLines] = useState<string[]>([]);
+  const [backendLogLines, setBackendLogLines] = useState<string[]>([]);
   const [uiErrorMessage, setUiErrorMessage] = useState<string | null>(null);
 
   const jobRootDirectoryPathRef = useRef<string | null>(null);
@@ -62,6 +65,11 @@ export function App() {
     return Math.max(0, Math.min(1, ratio));
   }, [jobStatus]);
 
+  const logLines = useMemo(() => {
+    // UI logs are ephemeral user actions; backend logs are engine output.
+    return [...uiLogLines, ...backendLogLines];
+  }, [uiLogLines, backendLogLines]);
+
   const canStart = useMemo(() => {
     if (jobRootDirectoryPath === null) {
       return false;
@@ -73,44 +81,26 @@ export function App() {
   }, [jobRootDirectoryPath, jobStatus?.is_running, droppedPathCount]);
 
   useEffect(() => {
-    let unlistenPromise: Promise<() => void> | null = null;
-    unlistenPromise = listen<string[]>("tauri://file-drop", async (event) => {
-      const currentJobRootDirectoryPath = jobRootDirectoryPathRef.current;
-      if (currentJobRootDirectoryPath === null) {
-        setUiErrorMessage("Select an output directory before dropping files.");
-        return;
-      }
-
-      const droppedPaths = event.payload ?? [];
-      if (droppedPaths.length <= 0) {
-        return;
-      }
-
-      try {
-        setUiErrorMessage(null);
-        await invoke("job_add_inputs", {
-          jobRootDirectoryPath: currentJobRootDirectoryPath,
-          inputPaths: droppedPaths
-        });
-        setDroppedPathCount((previous) => previous + droppedPaths.length);
-      } catch (error) {
-        setUiErrorMessage(String(error));
-      }
-    });
-
-    const unlistenDragEnter = listen("tauri://drag-enter", () => setIsDragging(true));
-    const unlistenDragLeave = listen("tauri://drag-leave", () => setIsDragging(false));
-
-    return () => {
-      if (unlistenPromise !== null) {
-        void unlistenPromise.then((unlisten) => unlisten());
-      }
-      void unlistenDragEnter.then((unlisten) => unlisten());
-      void unlistenDragLeave.then((unlisten) => unlisten());
-    };
-  }, []);
+    if (!isRunningInsideTauri) {
+      // Guard: When running as a normal browser tab (not in Tauri), native file dialogs are unavailable.
+      setUiErrorMessage(
+        "You are running in a normal browser tab. File pickers and OCR execution require the Tauri desktop app."
+      );
+    }
+  }, [isRunningInsideTauri]);
 
   useEffect(() => {
+    if (isRunningInsideTauri) {
+      // Guard: clear the “browser tab” warning when Tauri is detected.
+      setUiErrorMessage(null);
+    }
+  }, [isRunningInsideTauri]);
+
+  useEffect(() => {
+    if (!isRunningInsideTauri) {
+      // Guard: do not call invoke() outside of Tauri.
+      return;
+    }
     if (jobRootDirectoryPath === null) {
       return;
     }
@@ -137,6 +127,10 @@ export function App() {
   }, [jobRootDirectoryPath]);
 
   useEffect(() => {
+    if (!isRunningInsideTauri) {
+      // Guard: do not call invoke() outside of Tauri.
+      return;
+    }
     if (jobRootDirectoryPath === null) {
       return;
     }
@@ -150,7 +144,7 @@ export function App() {
         const response = await invoke<JobLogResponse>("get_job_logs", {
           jobRootDirectoryPath
         });
-        setLogLines(response.lines);
+        setBackendLogLines(response.lines);
       } catch {
         // Guard: log polling should not spam errors when job isn't running yet.
       }
@@ -163,6 +157,10 @@ export function App() {
   }, [jobRootDirectoryPath]);
 
   async function handlePickOutputDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Folder picker is only available in the Tauri desktop app.");
+      return;
+    }
     try {
       setUiErrorMessage(null);
       const selectedDirectoryPath = await invoke<string | null>("pick_output_directory");
@@ -171,13 +169,98 @@ export function App() {
       }
       setJobRootDirectoryPath(selectedDirectoryPath);
       setDroppedPathCount(0);
-      setLogLines([]);
+      setUiLogLines([]);
+      setBackendLogLines([]);
     } catch (error) {
       setUiErrorMessage(String(error));
     }
   }
 
+  function appendUiLogLine(line: string): void {
+    setUiLogLines((previous) => {
+      const next = [...previous, line];
+      if (next.length <= MAX_UI_LOG_LINES) {
+        return next;
+      }
+      return next.slice(next.length - MAX_UI_LOG_LINES);
+    });
+  }
+
+  async function handleAddInputFiles(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Input selection is only available in the Tauri desktop app.");
+      return;
+    }
+    const currentJobRootDirectoryPath = jobRootDirectoryPathRef.current;
+    if (currentJobRootDirectoryPath === null) {
+      setUiErrorMessage("Select an output directory first.");
+      return;
+    }
+
+    try {
+      setUiErrorMessage(null);
+      appendUiLogLine("[inputs] selecting files…");
+      const selectedPaths = await invoke<string[] | null>("pick_input_files");
+      if (selectedPaths === null || selectedPaths.length <= 0) {
+        appendUiLogLine("[inputs] cancelled");
+        return;
+      }
+      appendUiLogLine(`[inputs] adding ${selectedPaths.length} path(s)…`);
+      await invoke("job_add_inputs", {
+        jobRootDirectoryPath: currentJobRootDirectoryPath,
+        inputPaths: selectedPaths
+      });
+      setDroppedPathCount((previous) => previous + selectedPaths.length);
+      appendUiLogLine("[inputs] added");
+    } catch (error) {
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[inputs] ERROR: ${errorMessage}`);
+    }
+  }
+
+  async function handleAddInputFolder(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Input selection is only available in the Tauri desktop app.");
+      return;
+    }
+    const currentJobRootDirectoryPath = jobRootDirectoryPathRef.current;
+    if (currentJobRootDirectoryPath === null) {
+      setUiErrorMessage("Select an output directory first.");
+      return;
+    }
+
+    try {
+      setUiErrorMessage(null);
+      appendUiLogLine("[inputs] selecting folder…");
+      const selectedFolder = await invoke<string | null>("pick_input_folder");
+      if (selectedFolder === null) {
+        appendUiLogLine("[inputs] cancelled");
+        return;
+      }
+      appendUiLogLine("[inputs] adding 1 folder…");
+      await invoke("job_add_inputs", {
+        jobRootDirectoryPath: currentJobRootDirectoryPath,
+        inputPaths: [selectedFolder]
+      });
+      setDroppedPathCount((previous) => previous + 1);
+      appendUiLogLine("[inputs] added");
+    } catch (error) {
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[inputs] ERROR: ${errorMessage}`);
+    }
+  }
+
   async function handleRunJob(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("OCR execution is only available in the Tauri desktop app.");
+      return;
+    }
+    if (isStartingRun) {
+      // Guard: prevent accidental double-click starting two jobs.
+      return;
+    }
     const currentJobRootDirectoryPath = jobRootDirectoryPath;
     if (currentJobRootDirectoryPath === null) {
       setUiErrorMessage("Select an output directory first.");
@@ -186,37 +269,61 @@ export function App() {
 
     try {
       setUiErrorMessage(null);
+      appendUiLogLine("[run] starting…");
+      setIsStartingRun(true);
       await invoke("probe_docker", {});
       await invoke("run_job", { jobRootDirectoryPath: currentJobRootDirectoryPath });
+      appendUiLogLine("[run] started");
     } catch (error) {
-      setUiErrorMessage(String(error));
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[run] ERROR: ${errorMessage}`);
+    } finally {
+      setIsStartingRun(false);
     }
   }
 
   async function handleProbeGpu(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("GPU check is only available in the Tauri desktop app.");
+      return;
+    }
     try {
       setUiErrorMessage(null);
+      appendUiLogLine("[gpu-probe] running…");
       const output = await invoke<string>("probe_gpu_passthrough", {});
-      setLogLines((previous) => [...previous, "[gpu-probe] OK", output]);
+      appendUiLogLine("[gpu-probe] OK");
+      appendUiLogLine(output);
     } catch (error) {
-      setUiErrorMessage(String(error));
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[gpu-probe] ERROR: ${errorMessage}`);
     }
   }
 
   async function handleCancelJob(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
     const currentJobRootDirectoryPath = jobRootDirectoryPath;
     if (currentJobRootDirectoryPath === null) {
       return;
     }
     try {
       setUiErrorMessage(null);
+      appendUiLogLine("[cancel] requested");
       await invoke("cancel_job", { jobRootDirectoryPath: currentJobRootDirectoryPath });
     } catch (error) {
-      setUiErrorMessage(String(error));
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[cancel] ERROR: ${errorMessage}`);
     }
   }
 
   async function handleOpenOutputDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
     if (jobRootDirectoryPath === null) {
       return;
     }
@@ -228,16 +335,23 @@ export function App() {
   }
 
   async function handleResetJobDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
     if (jobRootDirectoryPath === null) {
       return;
     }
     try {
       setUiErrorMessage(null);
+      appendUiLogLine("[reset] starting…");
       await invoke("reset_job_directory", { jobRootDirectoryPath });
       setDroppedPathCount(0);
-      setLogLines([]);
+      setUiLogLines([]);
+      setBackendLogLines([]);
     } catch (error) {
-      setUiErrorMessage(String(error));
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[reset] ERROR: ${errorMessage}`);
     }
   }
 
@@ -267,11 +381,13 @@ export function App() {
     <div className="container">
       <div className="titleRow">
         <h1 className="title">ocr-agent</h1>
-        <div className="label">{statusLabel}</div>
+        <div className="label">
+          {statusLabel} · Tauri: <b>{isRunningInsideTauri ? "yes" : "no"}</b>
+        </div>
       </div>
       <div className="subtitle">
-        Drag &amp; drop images or PDFs. PDFs are automatically queued per page, then merged into
-        Markdown.
+        Select an output directory, then add input images/PDFs (or a folder). PDFs are automatically queued per page,
+        then merged into Markdown.
       </div>
 
       <div style={{ height: 14 }} />
@@ -281,10 +397,18 @@ export function App() {
           <button className="button buttonPrimary" onClick={handlePickOutputDirectory}>
             Select output directory (job root)
           </button>
-          <button className="button" onClick={handleOpenOutputDirectory} disabled={jobRootDirectoryPath === null}>
+          <button
+            className="button"
+            onClick={handleOpenOutputDirectory}
+            disabled={!isRunningInsideTauri || jobRootDirectoryPath === null}
+          >
             Open folder
           </button>
-          <button className="button" onClick={handleResetJobDirectory} disabled={jobRootDirectoryPath === null || jobStatus?.is_running === true}>
+          <button
+            className="button"
+            onClick={handleResetJobDirectory}
+            disabled={!isRunningInsideTauri || jobRootDirectoryPath === null || jobStatus?.is_running === true}
+          >
             Reset job (delete queue/output)
           </button>
         </div>
@@ -295,14 +419,29 @@ export function App() {
 
       <div style={{ height: 14 }} />
 
-      <div className={`card dropZone ${isDragging ? "dropZoneStrong" : ""}`}>
-        <div style={{ fontWeight: 700 }}>Drop files or folders here</div>
+      <div className="card">
+        <div className="row">
+          <button
+            className="button"
+            onClick={handleAddInputFiles}
+            disabled={!isRunningInsideTauri || jobRootDirectoryPath === null || jobStatus?.is_running === true}
+          >
+            Add files (images/PDF)
+          </button>
+          <button
+            className="button"
+            onClick={handleAddInputFolder}
+            disabled={!isRunningInsideTauri || jobRootDirectoryPath === null || jobStatus?.is_running === true}
+          >
+            Add folder
+          </button>
+        </div>
+        <div style={{ height: 10 }} />
         <div className="label">
-          We copy your inputs into <span className="mono">input/</span> under the selected output
-          directory.
+          Added items this session: <b>{droppedPathCount}</b>
         </div>
         <div className="label">
-          Dropped items this session: <b>{droppedPathCount}</b>
+          Inputs are copied into <span className="mono">input/</span> under the selected output directory.
         </div>
       </div>
 
@@ -310,13 +449,25 @@ export function App() {
 
       <div className="card">
         <div className="row">
-          <button className="button buttonPrimary" onClick={handleRunJob} disabled={!canStart}>
+          <button
+            className="button buttonPrimary"
+            onClick={handleRunJob}
+            disabled={!isRunningInsideTauri || !canStart || isStartingRun}
+          >
             Start OCR (enqueue → run)
           </button>
-          <button className="button" onClick={handleProbeGpu} disabled={jobStatus?.is_running === true}>
+          <button
+            className="button"
+            onClick={handleProbeGpu}
+            disabled={!isRunningInsideTauri || jobStatus?.is_running === true}
+          >
             Check GPU
           </button>
-          <button className="button buttonDanger" onClick={handleCancelJob} disabled={!jobStatus?.is_running}>
+          <button
+            className="button buttonDanger"
+            onClick={handleCancelJob}
+            disabled={!isRunningInsideTauri || !jobStatus?.is_running}
+          >
             Cancel
           </button>
         </div>
