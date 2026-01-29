@@ -141,6 +141,38 @@ GUIの使い方:
 - 「Start OCR」で実行
 - 結果: `output.md`（中間: `output/`, キュー: `queue.sqlite3`, 入力コピー: `input/`）
 
+## 自動化（watch-folder）: 外部連携の受け口（Slack前のベストプラクティス）
+Slack連携を作る前に、まず「外部からファイルが入ってきたら自動でOCRする」を成立させるための仕組みです。
+GUIを起動したまま **inboxフォルダを監視**し、投入が完了したバンドルを検知してジョブ化します。
+
+### 使い方
+GUIで以下を設定します:
+- **Select inbox directory**: 監視する受け口フォルダ（例: `C:\ocr-agent-inbox`）
+- **Select jobs root (optional)**: ジョブ出力先ルート（未指定なら `inbox/jobs`）
+- **Start watch-folder**: 監視開始
+
+### 投入契約（初見が詰まらない最小仕様）
+Windowsのファイルコピーは途中状態が見えることがあるため、**`.ready` を「投入完了の合図」**にします。
+
+1) `inbox/<bundle>/` を作り、その中に画像/PDF（またはサブフォルダ）をコピー  
+2) 最後に `inbox/<bundle>/.ready` を作成（空ファイルでOK）  
+3) GUIが検知するとジョブが作られ、OCRが始まります
+
+生成されるもの（jobs root配下）:
+- `jobs/<job_id>/input/`（投入コピー）
+- `jobs/<job_id>/output/`（中間生成物）
+- `jobs/<job_id>/ocr_output_<timestamp>.md`（結果Markdown）
+- `jobs/<job_id>/job_state.json`（ジョブ状態: queued/running/completed/failed）
+
+inbox側のマーカー（bundle内）:
+- `.ready`: 投入完了
+- `.processing`: 処理中（排他用）
+- `.processed`: 受理済み（重複処理防止）
+- `.failed`: 受理失敗（エラー内容が書かれる）
+
+### Slackへ移行するとき
+将来Slackを実装するときは、Slack側でダウンロードしたファイルをこの `inbox/<bundle>/` に置く（または同等のJobRouterを呼ぶ）だけで移行できます。
+
 ### メモ: リポジトリ外から実行したい場合
 GUIは `compose.yaml` を使ってDocker実行します。`compose.yaml` の場所が自動推定できない場合は、環境変数で指定できます。
 

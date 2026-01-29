@@ -10,7 +10,9 @@ __pycache__/
 # Local data & artifacts (keep directory structure via .gitkeep)
 data/**
 !data/.gitkeep
+!data/input/
 !data/input/.gitkeep
+!data/output/
 !data/output/.gitkeep
 
 # Tauri GUI (Node/Vite)

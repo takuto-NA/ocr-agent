@@ -26,6 +26,22 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::sync::oneshot;
 use tauri_plugin_dialog::FilePath;
 
+mod watch_folder;
+use watch_folder::{
+  default_poll_interval as default_watch_poll_interval,
+  get_watch_folder_status as get_watch_folder_status_from_state,
+  list_ready_bundle_directories,
+  mark_bundle_failed,
+  mark_bundle_processed,
+  new_shared_watch_folder_state,
+  start_watch_folder as start_watch_folder_with_callback,
+  stop_watch_folder as stop_watch_folder_internal,
+  try_lock_bundle_for_processing,
+  SharedWatchFolderRuntimeState,
+  WatchFolderConfig,
+  WatchFolderStatus,
+};
+
 const DEFAULT_QUEUE_DATABASE_FILENAME: &str = "queue.sqlite3";
 const DEFAULT_INPUT_DIRECTORY_NAME: &str = "input";
 const DEFAULT_OUTPUT_DIRECTORY_NAME: &str = "output";
@@ -40,6 +56,14 @@ const MAX_COPY_COLLISION_ATTEMPTS: u32 = 1000;
 const DOCKER_COMPOSE_SERVICE_NAME: &str = "ocr-agent";
 const OCR_AGENT_REPO_ROOT_ENVIRONMENT_VARIABLE_NAME: &str = "OCR_AGENT_REPO_ROOT";
 const MAX_PREVIEW_IMAGE_BYTES: u64 = 8_000_000;
+const MAX_REPO_ROOT_SEARCH_DEPTH: usize = 8;
+
+const DEFAULT_WATCH_JOBS_DIRECTORY_NAME: &str = "jobs";
+const DEFAULT_WATCH_JOB_STATE_FILENAME: &str = "job_state.json";
+const DEFAULT_WATCH_READY_FILENAME: &str = ".ready";
+
+const OCR_AGENT_WATCH_INBOX_ENVIRONMENT_VARIABLE_NAME: &str = "OCR_AGENT_WATCH_INBOX";
+const OCR_AGENT_WATCH_JOBS_ROOT_ENVIRONMENT_VARIABLE_NAME: &str = "OCR_AGENT_WATCH_JOBS_ROOT";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct JobSettings {
@@ -127,6 +151,7 @@ struct RunningJobHandle {
 struct JobRuntimeState {
   running_job_by_root: HashMap<PathBuf, RunningJobHandle>,
   log_lines_by_root: HashMap<PathBuf, VecDeque<String>>,
+  job_state_file_path_by_root: HashMap<PathBuf, PathBuf>,
 }
 
 type SharedJobRuntimeState = Arc<Mutex<JobRuntimeState>>;
@@ -203,6 +228,15 @@ fn repo_root_path() -> Result<PathBuf, String> {
     return Ok(normalize_windows_path_buf(&canonical));
   }
 
+  // Guard: support running the GUI binary from outside the repo by searching upward from the executable.
+  if let Ok(exe_path) = std::env::current_exe() {
+    if let Some(exe_directory_path) = exe_path.parent() {
+      if let Some(found) = find_repo_root_by_walking_up(exe_directory_path) {
+        return Ok(found);
+      }
+    }
+  }
+
   let manifest_directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
   let repo_root_candidate = manifest_directory_path
     .parent()
@@ -212,6 +246,20 @@ fn repo_root_path() -> Result<PathBuf, String> {
     .canonicalize()
     .map_err(|error| format!("Failed to canonicalize repo root: {error}"))?;
   Ok(normalize_windows_path_buf(&canonical))
+}
+
+fn find_repo_root_by_walking_up(start_directory_path: &Path) -> Option<PathBuf> {
+  let mut current = start_directory_path.to_path_buf();
+  for _ in 0..MAX_REPO_ROOT_SEARCH_DEPTH {
+    let compose_candidate = current.join("compose.yaml");
+    if compose_candidate.exists() {
+      let canonical = current.canonicalize().ok()?;
+      return Some(normalize_windows_path_buf(&canonical));
+    }
+    let parent = current.parent()?;
+    current = parent.to_path_buf();
+  }
+  None
 }
 
 fn compose_file_path(repo_root: &Path) -> PathBuf {
@@ -336,7 +384,70 @@ fn probe_gpu_passthrough() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_watch_folder_status(
+  watch_folder_state: State<'_, SharedWatchFolderRuntimeState>,
+) -> Result<WatchFolderStatus, String> {
+  Ok(get_watch_folder_status_from_state(watch_folder_state.inner()))
+}
+
+#[tauri::command]
+fn stop_watch_folder(watch_folder_state: State<'_, SharedWatchFolderRuntimeState>) -> Result<(), String> {
+  stop_watch_folder_internal(watch_folder_state.inner());
+  Ok(())
+}
+
+#[tauri::command]
+fn start_watch_folder(
+  inbox_directory_path: String,
+  jobs_root_directory_path: Option<String>,
+  job_runtime_state: State<'_, SharedJobRuntimeState>,
+  watch_folder_state: State<'_, SharedWatchFolderRuntimeState>,
+) -> Result<(), String> {
+  let inbox_directory_path = PathBuf::from(inbox_directory_path);
+  let jobs_root_directory_path = jobs_root_directory_path
+    .and_then(|raw| {
+      let trimmed = raw.trim().to_string();
+      if trimmed.is_empty() {
+        return None;
+      }
+      Some(trimmed)
+    })
+    .map(PathBuf::from)
+    .unwrap_or_else(|| inbox_directory_path.join(DEFAULT_WATCH_JOBS_DIRECTORY_NAME));
+
+  let config = WatchFolderConfig {
+    inbox_directory_path,
+    jobs_root_directory_path,
+    poll_interval: default_watch_poll_interval(),
+  };
+
+  let poll_callback = make_watch_folder_poll_callback(job_runtime_state.inner().clone());
+
+  start_watch_folder_with_callback(watch_folder_state.inner(), config, poll_callback)?;
+  Ok(())
+}
+
+#[tauri::command]
 async fn pick_output_directory(app_handle: tauri::AppHandle<Wry>) -> Result<Option<String>, String> {
+  let (sender, receiver) = oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+  app_handle.dialog().file().pick_folder(move |path| {
+    // Guard: receiver side may be dropped if the request is cancelled.
+    let _ = sender.send(path);
+  });
+
+  let selected_directory_path = receiver
+    .await
+    .map_err(|_| "Failed to receive folder picker result".to_string())?;
+
+  let Some(directory_path) = selected_directory_path else {
+    return Ok(None);
+  };
+
+  Ok(Some(file_path_to_string(directory_path)))
+}
+
+#[tauri::command]
+async fn pick_directory(app_handle: tauri::AppHandle<Wry>) -> Result<Option<String>, String> {
   let (sender, receiver) = oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
   app_handle.dialog().file().pick_folder(move |path| {
     // Guard: receiver side may be dropped if the request is cancelled.
@@ -777,6 +888,44 @@ fn append_log_line(job_runtime_state: &SharedJobRuntimeState, job_root_directory
   }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JobStateStatus {
+  Queued,
+  Running,
+  Completed,
+  Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobState {
+  status: JobStateStatus,
+  job_id: String,
+  job_root_directory_path: String,
+  source_bundle_directory_path: Option<String>,
+  accepted_unix_timestamp_millis: i64,
+  started_unix_timestamp_millis: Option<i64>,
+  finished_unix_timestamp_millis: Option<i64>,
+  output_markdown_path: Option<String>,
+  error_message: Option<String>,
+}
+
+fn job_state_file_path(job_root_directory_path: &Path) -> PathBuf {
+  job_root_directory_path.join(DEFAULT_WATCH_JOB_STATE_FILENAME)
+}
+
+fn write_job_state(job_root_directory_path: &Path, state: &JobState) -> Result<(), String> {
+  let serialized = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+  fs::write(job_state_file_path(job_root_directory_path), serialized).map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn read_job_state_best_effort(job_root_directory_path: &Path) -> Option<JobState> {
+  let path = job_state_file_path(job_root_directory_path);
+  let raw = fs::read_to_string(path).ok()?;
+  serde_json::from_str::<JobState>(&raw).ok()
+}
+
 fn spawn_log_reader_thread(
   job_runtime_state: SharedJobRuntimeState,
   job_root_directory_path: PathBuf,
@@ -906,6 +1055,27 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
       .log_lines_by_root
       .entry(job_root_directory_path.clone())
       .or_insert_with(VecDeque::new);
+
+    // Guard: watcher-created jobs track their state in a separate file.
+    if locked_state
+      .job_state_file_path_by_root
+      .contains_key(&job_root_directory_path)
+    {
+      let mut state = read_job_state_best_effort(&job_root_directory_path).unwrap_or(JobState {
+        status: JobStateStatus::Queued,
+        job_id: "unknown".to_string(),
+        job_root_directory_path: job_root_directory_path.to_string_lossy().to_string(),
+        source_bundle_directory_path: None,
+        accepted_unix_timestamp_millis: now_unix_timestamp_millis(),
+        started_unix_timestamp_millis: None,
+        finished_unix_timestamp_millis: None,
+        output_markdown_path: None,
+        error_message: None,
+      });
+      state.status = JobStateStatus::Running;
+      state.started_unix_timestamp_millis = Some(start_unix_timestamp_millis);
+      let _ = write_job_state(&job_root_directory_path, &state);
+    }
   }
 
   if let Some(stream) = stdout {
@@ -954,9 +1124,195 @@ fn spawn_job_process(job_runtime_state: SharedJobRuntimeState, job_root_director
       Err(_) => return,
     };
     locked_state.running_job_by_root.remove(&waiter_job_root);
+
+    let job_state_path = locked_state.job_state_file_path_by_root.remove(&waiter_job_root);
+    drop(locked_state);
+
+    // Guard: only watcher-created jobs register a job state path.
+    let Some(job_state_path) = job_state_path else {
+      return;
+    };
+
+    let mut state = read_job_state_best_effort(&waiter_job_root).unwrap_or(JobState {
+      status: JobStateStatus::Running,
+      job_id: "unknown".to_string(),
+      job_root_directory_path: waiter_job_root.to_string_lossy().to_string(),
+      source_bundle_directory_path: None,
+      accepted_unix_timestamp_millis: now_unix_timestamp_millis(),
+      started_unix_timestamp_millis: None,
+      finished_unix_timestamp_millis: None,
+      output_markdown_path: None,
+      error_message: None,
+    });
+    state.finished_unix_timestamp_millis = Some(now_unix_timestamp_millis());
+
+    if exit_status.success() {
+      state.status = JobStateStatus::Completed;
+      state.error_message = None;
+      state.output_markdown_path = state
+        .output_markdown_path
+        .or_else(|| detect_last_output_markdown_path(&waiter_job_root));
+    } else {
+      state.status = JobStateStatus::Failed;
+      state.error_message = Some(format!("OCR process failed: {exit_status}"));
+    }
+
+    // Guard: best-effort write; never panic from background thread.
+    let _ = fs::write(job_state_path, serde_json::to_string_pretty(&state).unwrap_or_default());
   });
 
   Ok(())
+}
+
+fn is_any_job_running(job_runtime_state: &SharedJobRuntimeState) -> bool {
+  let locked = match job_runtime_state.lock() {
+    Ok(value) => value,
+    Err(_) => return true,
+  };
+  !locked.running_job_by_root.is_empty()
+}
+
+fn derive_watch_job_id(source_bundle_directory_path: &Path) -> String {
+  let base = source_bundle_directory_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("bundle");
+  let sanitized = base
+    .replace('\\', "_")
+    .replace('/', "_")
+    .replace(':', "_")
+    .replace(' ', "_");
+  format!("{}_{}", now_unix_timestamp_millis(), sanitized)
+}
+
+fn copy_directory_recursively_with_exclusions(
+  source_directory_path: &Path,
+  destination_directory_path: &Path,
+  excluded_filenames: &[&str],
+) -> Result<u64, String> {
+  if !source_directory_path.exists() {
+    // Guard: do not silently ignore missing paths.
+    return Err(format!(
+      "Input directory does not exist: {}",
+      source_directory_path.display()
+    ));
+  }
+  if !source_directory_path.is_dir() {
+    // Guard: this function only handles directories.
+    return Err(format!("Not a directory: {}", source_directory_path.display()));
+  }
+  fs::create_dir_all(destination_directory_path).map_err(|error| error.to_string())?;
+
+  let mut total_copied_files: u64 = 0;
+  for entry in walkdir::WalkDir::new(source_directory_path) {
+    let entry = entry.map_err(|error| error.to_string())?;
+    let entry_path = entry.path();
+    if entry_path.is_dir() {
+      continue;
+    }
+    let file_name = entry_path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if excluded_filenames.contains(&file_name) {
+      continue;
+    }
+    let relative_path = entry_path
+      .strip_prefix(source_directory_path)
+      .map_err(|error| error.to_string())?;
+    let destination_path = destination_directory_path.join(relative_path);
+    if let Some(parent_directory_path) = destination_path.parent() {
+      fs::create_dir_all(parent_directory_path).map_err(|error| error.to_string())?;
+    }
+    fs::copy(entry_path, &destination_path).map_err(|error| error.to_string())?;
+    total_copied_files += 1;
+  }
+  Ok(total_copied_files)
+}
+
+fn create_watch_job_from_bundle(
+  job_runtime_state: SharedJobRuntimeState,
+  jobs_root_directory_path: &Path,
+  bundle_directory_path: &Path,
+) -> Result<PathBuf, String> {
+  let job_id = derive_watch_job_id(bundle_directory_path);
+  let job_root_directory_path = jobs_root_directory_path.join(job_id);
+  fs::create_dir_all(&job_root_directory_path).map_err(|error| error.to_string())?;
+  ensure_job_directory_layout(&job_root_directory_path)?;
+
+  let input_directory_path = job_root_directory_path.join(DEFAULT_INPUT_DIRECTORY_NAME);
+  let excluded = [
+    DEFAULT_WATCH_READY_FILENAME,
+    ".processing",
+    ".processed",
+    ".failed",
+  ];
+  let _ = copy_directory_recursively_with_exclusions(bundle_directory_path, &input_directory_path, &excluded)?;
+
+  let accepted_at = now_unix_timestamp_millis();
+  let job_id_for_state = job_root_directory_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("job")
+    .to_string();
+  let job_state = JobState {
+    status: JobStateStatus::Queued,
+    job_id: job_id_for_state,
+    job_root_directory_path: job_root_directory_path.to_string_lossy().to_string(),
+    source_bundle_directory_path: Some(bundle_directory_path.to_string_lossy().to_string()),
+    accepted_unix_timestamp_millis: accepted_at,
+    started_unix_timestamp_millis: None,
+    finished_unix_timestamp_millis: None,
+    output_markdown_path: None,
+    error_message: None,
+  };
+  write_job_state(&job_root_directory_path, &job_state)?;
+
+  {
+    let mut locked_state = job_runtime_state.lock().map_err(|_| "State lock poisoned".to_string())?;
+    locked_state
+      .job_state_file_path_by_root
+      .insert(job_root_directory_path.clone(), job_state_file_path(&job_root_directory_path));
+  }
+
+  spawn_job_process(job_runtime_state, job_root_directory_path.clone())?;
+  Ok(job_root_directory_path)
+}
+
+fn make_watch_folder_poll_callback(
+  shared_job_runtime_state: SharedJobRuntimeState,
+) -> Arc<dyn Fn(&WatchFolderConfig) -> Result<(), String> + Send + Sync> {
+  Arc::new(move |config: &WatchFolderConfig| {
+    if is_any_job_running(&shared_job_runtime_state) {
+      // Guard: enforce single-job execution on a single Windows host.
+      return Ok(());
+    }
+
+    let bundle_directories = list_ready_bundle_directories(&config.inbox_directory_path)?;
+    for bundle_directory_path in bundle_directories {
+      let locked = try_lock_bundle_for_processing(&bundle_directory_path)?;
+      if !locked {
+        continue;
+      }
+
+      let create_result = create_watch_job_from_bundle(
+        shared_job_runtime_state.clone(),
+        &config.jobs_root_directory_path,
+        &bundle_directory_path,
+      );
+      if let Err(error_message) = create_result {
+        let _ = mark_bundle_failed(&bundle_directory_path, &error_message);
+        return Err(error_message);
+      }
+      let _ = mark_bundle_processed(&bundle_directory_path);
+      return Ok(());
+    }
+
+    Ok(())
+  })
+}
+
+fn detect_last_output_markdown_path(job_root_directory_path: &Path) -> Option<String> {
+  let settings = read_job_settings_best_effort(job_root_directory_path);
+  let filename = settings.last_output_markdown_filename?;
+  Some(job_root_directory_path.join(filename).to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1188,14 +1544,41 @@ fn open_in_file_manager(target_path: String) -> Result<(), String> {
 
 fn main() {
   let job_runtime_state: SharedJobRuntimeState = Arc::new(Mutex::new(JobRuntimeState::default()));
+  let watch_folder_state: SharedWatchFolderRuntimeState = new_shared_watch_folder_state();
+
+  // Guard: allow headless-ish automation by environment variables (useful for future Slack agent wiring).
+  // If these are set, the watcher starts immediately on app startup.
+  if let Ok(inbox) = std::env::var(OCR_AGENT_WATCH_INBOX_ENVIRONMENT_VARIABLE_NAME) {
+    let inbox_trimmed = inbox.trim().to_string();
+    if !inbox_trimmed.is_empty() {
+      let jobs_root = std::env::var(OCR_AGENT_WATCH_JOBS_ROOT_ENVIRONMENT_VARIABLE_NAME)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+      let inbox_directory_path = PathBuf::from(inbox_trimmed);
+      let jobs_root_directory_path = jobs_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| inbox_directory_path.join(DEFAULT_WATCH_JOBS_DIRECTORY_NAME));
+
+      let config = WatchFolderConfig {
+        inbox_directory_path,
+        jobs_root_directory_path,
+        poll_interval: default_watch_poll_interval(),
+      };
+      let poll_callback = make_watch_folder_poll_callback(job_runtime_state.clone());
+      let _ = start_watch_folder_with_callback(&watch_folder_state, config, poll_callback);
+    }
+  }
 
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
     .manage(job_runtime_state)
+    .manage(watch_folder_state)
     .invoke_handler(tauri::generate_handler![
       probe_docker,
       probe_gpu_passthrough,
       pick_output_directory,
+      pick_directory,
       pick_input_files,
       pick_input_folder,
       job_add_inputs,
@@ -1206,7 +1589,10 @@ fn main() {
       run_job,
       cancel_job,
       reset_job_directory,
-      open_in_file_manager
+      open_in_file_manager,
+      get_watch_folder_status,
+      start_watch_folder,
+      stop_watch_folder
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

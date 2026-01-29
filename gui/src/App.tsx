@@ -29,10 +29,21 @@ type JobLogResponse = {
   lines: string[];
 };
 
+type WatchFolderStatus = {
+  is_running: boolean;
+  inbox_directory_path: string | null;
+  jobs_root_directory_path: string | null;
+  last_error_message: string | null;
+};
+
 const PROGRESS_POLL_INTERVAL_MILLIS = 900;
 const LOG_POLL_INTERVAL_MILLIS = 700;
 const MAX_UI_LOG_LINES = 400;
 const DEFAULT_LOG_VIEW_START_INDEX = 0;
+const WATCH_STATUS_POLL_INTERVAL_MILLIS = 1100;
+
+const LOCAL_STORAGE_WATCH_INBOX_DIRECTORY_PATH_KEY = "ocr-agent.watchInboxDirectoryPath";
+const LOCAL_STORAGE_WATCH_JOBS_ROOT_DIRECTORY_PATH_KEY = "ocr-agent.watchJobsRootDirectoryPath";
 
 const DEFAULT_DEEPSEEK_OCR2_BASE_IMAGE_SIZE_PIXELS = 1024;
 const DEFAULT_DEEPSEEK_OCR2_INFERENCE_IMAGE_SIZE_PIXELS = 768;
@@ -114,6 +125,9 @@ export function App() {
   const [currentTaskPreviewImageUrl, setCurrentTaskPreviewImageUrl] = useState<string | null>(null);
   const [uiErrorMessage, setUiErrorMessage] = useState<string | null>(null);
   const [logViewStartIndex, setLogViewStartIndex] = useState<number>(DEFAULT_LOG_VIEW_START_INDEX);
+  const [watchInboxDirectoryPath, setWatchInboxDirectoryPath] = useState<string>("");
+  const [watchJobsRootDirectoryPath, setWatchJobsRootDirectoryPath] = useState<string>("");
+  const [watchFolderStatus, setWatchFolderStatus] = useState<WatchFolderStatus | null>(null);
 
   const jobRootDirectoryPathRef = useRef<string | null>(null);
   jobRootDirectoryPathRef.current = jobRootDirectoryPath;
@@ -165,6 +179,20 @@ export function App() {
   }, [isRunningInsideTauri]);
 
   useEffect(() => {
+    if (!isRunningInsideTauri) {
+      return;
+    }
+    try {
+      const inbox = window.localStorage.getItem(LOCAL_STORAGE_WATCH_INBOX_DIRECTORY_PATH_KEY) ?? "";
+      const jobsRoot = window.localStorage.getItem(LOCAL_STORAGE_WATCH_JOBS_ROOT_DIRECTORY_PATH_KEY) ?? "";
+      setWatchInboxDirectoryPath(inbox);
+      setWatchJobsRootDirectoryPath(jobsRoot);
+    } catch {
+      // Guard: localStorage access may fail in some environments.
+    }
+  }, [isRunningInsideTauri]);
+
+  useEffect(() => {
     if (isRunningInsideTauri) {
       // Guard: clear the “browser tab” warning when Tauri is detected.
       setUiErrorMessage(null);
@@ -200,6 +228,30 @@ export function App() {
       window.clearInterval(intervalId);
     };
   }, [jobRootDirectoryPath]);
+
+  useEffect(() => {
+    if (!isRunningInsideTauri) {
+      return;
+    }
+
+    let cancelled = false;
+    const intervalId = window.setInterval(async () => {
+      if (cancelled) {
+        return;
+      }
+      try {
+        const status = await invoke<WatchFolderStatus>("get_watch_folder_status", {});
+        setWatchFolderStatus(status);
+      } catch {
+        // Guard: watcher status polling should never break the main UI.
+      }
+    }, WATCH_STATUS_POLL_INTERVAL_MILLIS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [isRunningInsideTauri]);
 
   useEffect(() => {
     if (!isRunningInsideTauri) {
@@ -549,6 +601,111 @@ export function App() {
     }
   }
 
+  async function handlePickWatchInboxDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Folder picker is only available in the Tauri desktop app.");
+      return;
+    }
+    try {
+      const selectedDirectoryPath = await invoke<string | null>("pick_directory");
+      if (selectedDirectoryPath === null) {
+        return;
+      }
+      setWatchInboxDirectoryPath(selectedDirectoryPath);
+      window.localStorage.setItem(LOCAL_STORAGE_WATCH_INBOX_DIRECTORY_PATH_KEY, selectedDirectoryPath);
+    } catch (error) {
+      setUiErrorMessage(String(error));
+    }
+  }
+
+  async function handlePickWatchJobsRootDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Folder picker is only available in the Tauri desktop app.");
+      return;
+    }
+    try {
+      const selectedDirectoryPath = await invoke<string | null>("pick_directory");
+      if (selectedDirectoryPath === null) {
+        return;
+      }
+      setWatchJobsRootDirectoryPath(selectedDirectoryPath);
+      window.localStorage.setItem(LOCAL_STORAGE_WATCH_JOBS_ROOT_DIRECTORY_PATH_KEY, selectedDirectoryPath);
+    } catch (error) {
+      setUiErrorMessage(String(error));
+    }
+  }
+
+  async function handleStartWatchFolder(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      setUiErrorMessage("Automation is only available in the Tauri desktop app.");
+      return;
+    }
+    const inbox = watchInboxDirectoryPath.trim();
+    if (inbox === "") {
+      setUiErrorMessage("Select an inbox directory first.");
+      return;
+    }
+    try {
+      setUiErrorMessage(null);
+      appendUiLogLine("[watch-folder] starting…");
+      await invoke("start_watch_folder", {
+        inboxDirectoryPath: inbox,
+        jobsRootDirectoryPath: watchJobsRootDirectoryPath.trim() === "" ? null : watchJobsRootDirectoryPath.trim()
+      });
+      appendUiLogLine("[watch-folder] started");
+    } catch (error) {
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[watch-folder] ERROR: ${errorMessage}`);
+    }
+  }
+
+  async function handleStopWatchFolder(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
+    try {
+      setUiErrorMessage(null);
+      appendUiLogLine("[watch-folder] stopping…");
+      await invoke("stop_watch_folder", {});
+      appendUiLogLine("[watch-folder] stopped");
+    } catch (error) {
+      const errorMessage = String(error);
+      setUiErrorMessage(errorMessage);
+      appendUiLogLine(`[watch-folder] ERROR: ${errorMessage}`);
+    }
+  }
+
+  async function handleOpenWatchInboxDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
+    const inbox = watchInboxDirectoryPath.trim();
+    if (inbox === "") {
+      return;
+    }
+    try {
+      await invoke("open_in_file_manager", { targetPath: inbox });
+    } catch (error) {
+      setUiErrorMessage(String(error));
+    }
+  }
+
+  async function handleOpenWatchJobsDirectory(): Promise<void> {
+    if (!isRunningInsideTauri) {
+      return;
+    }
+    const jobsRoot = watchJobsRootDirectoryPath.trim();
+    if (jobsRoot === "") {
+      return;
+    }
+    try {
+      await invoke("open_in_file_manager", { targetPath: jobsRoot });
+    } catch (error) {
+      setUiErrorMessage(String(error));
+    }
+  }
+
   const statusLabel = useMemo(() => {
     if (jobRootDirectoryPath === null) {
       return "No job directory selected.";
@@ -655,6 +812,77 @@ export function App() {
                 <div className="label">
                   Inputs are copied into <span className="mono">input/</span> under the selected output directory.
                 </div>
+              </div>
+
+              <div style={{ height: 14 }} />
+
+              <div className="card">
+                <div className="label">Automation (watch folder)</div>
+                <div style={{ height: 8 }} />
+                <div className="label">
+                  Put files into a bundle folder, then create <span className="mono">.ready</span> to start OCR automatically.
+                </div>
+                <div style={{ height: 10 }} />
+                <div className="row">
+                  <button className="button" onClick={handlePickWatchInboxDirectory} disabled={!isRunningInsideTauri}>
+                    Select inbox directory
+                  </button>
+                  <button
+                    className="button"
+                    onClick={handleOpenWatchInboxDirectory}
+                    disabled={!isRunningInsideTauri || watchInboxDirectoryPath.trim() === ""}
+                  >
+                    Open inbox
+                  </button>
+                </div>
+                <div style={{ height: 8 }} />
+                <div className="mono">{watchInboxDirectoryPath.trim() === "" ? "(not selected)" : watchInboxDirectoryPath}</div>
+
+                <div style={{ height: 10 }} />
+                <div className="row">
+                  <button className="button" onClick={handlePickWatchJobsRootDirectory} disabled={!isRunningInsideTauri}>
+                    Select jobs root (optional)
+                  </button>
+                  <button
+                    className="button"
+                    onClick={handleOpenWatchJobsDirectory}
+                    disabled={!isRunningInsideTauri || watchJobsRootDirectoryPath.trim() === ""}
+                  >
+                    Open jobs
+                  </button>
+                </div>
+                <div style={{ height: 8 }} />
+                <div className="mono">
+                  {watchJobsRootDirectoryPath.trim() === "" ? "(default: inbox/jobs)" : watchJobsRootDirectoryPath}
+                </div>
+
+                <div style={{ height: 10 }} />
+                <div className="row">
+                  <button
+                    className="button buttonPrimary"
+                    onClick={handleStartWatchFolder}
+                    disabled={!isRunningInsideTauri || watchFolderStatus?.is_running === true}
+                  >
+                    Start watch-folder
+                  </button>
+                  <button
+                    className="button buttonDanger"
+                    onClick={handleStopWatchFolder}
+                    disabled={!isRunningInsideTauri || watchFolderStatus?.is_running !== true}
+                  >
+                    Stop
+                  </button>
+                </div>
+
+                <div style={{ height: 10 }} />
+                <div className="label">
+                  Status: <b>{watchFolderStatus?.is_running === true ? "running" : "stopped"}</b>
+                </div>
+                {watchFolderStatus?.last_error_message ? (
+                  <div className="label" style={{ color: "var(--danger)" }}>
+                    Watch error: {watchFolderStatus.last_error_message}
+                  </div>
+                ) : null}
               </div>
 
               <div style={{ height: 14 }} />
