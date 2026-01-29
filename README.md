@@ -150,6 +150,7 @@ GUIで以下を設定します:
 - **Select inbox directory**: 監視する受け口フォルダ（例: `C:\ocr-agent-inbox`）
 - **Select jobs root (optional)**: ジョブ出力先ルート（未指定なら `inbox/jobs`）
 - **Start watch-folder**: 監視開始
+- **Auto-run OCR after ingest**: ONにすると投入検知後すぐOCR実行します（重くなり得るため、まずはOFF推奨）
 
 ### 投入契約（初見が詰まらない最小仕様）
 Windowsのファイルコピーは途中状態が見えることがあるため、**`.ready` を「投入完了の合図」**にします。
@@ -157,6 +158,7 @@ Windowsのファイルコピーは途中状態が見えることがあるため�
 1) `inbox/<bundle>/` を作り、その中に画像/PDF（またはサブフォルダ）をコピー  
 2) 最後に `inbox/<bundle>/.ready` を作成（空ファイルでOK）  
 3) GUIが検知するとジョブが作られ、OCRが始まります
+   - Auto-runがOFFの場合はジョブ作成（queued）までで止まり、必要なら手動でOCR実行します
 
 生成されるもの（jobs root配下）:
 - `jobs/<job_id>/input/`（投入コピー）

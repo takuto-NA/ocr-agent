@@ -400,6 +400,7 @@ fn stop_watch_folder(watch_folder_state: State<'_, SharedWatchFolderRuntimeState
 fn start_watch_folder(
   inbox_directory_path: String,
   jobs_root_directory_path: Option<String>,
+  auto_run: Option<bool>,
   job_runtime_state: State<'_, SharedJobRuntimeState>,
   watch_folder_state: State<'_, SharedWatchFolderRuntimeState>,
 ) -> Result<(), String> {
@@ -421,7 +422,7 @@ fn start_watch_folder(
     poll_interval: default_watch_poll_interval(),
   };
 
-  let poll_callback = make_watch_folder_poll_callback(job_runtime_state.inner().clone());
+  let poll_callback = make_watch_folder_poll_callback(job_runtime_state.inner().clone(), auto_run.unwrap_or(false));
 
   start_watch_folder_with_callback(watch_folder_state.inner(), config, poll_callback)?;
   Ok(())
@@ -1231,6 +1232,7 @@ fn create_watch_job_from_bundle(
   job_runtime_state: SharedJobRuntimeState,
   jobs_root_directory_path: &Path,
   bundle_directory_path: &Path,
+  auto_run: bool,
 ) -> Result<PathBuf, String> {
   let job_id = derive_watch_job_id(bundle_directory_path);
   let job_root_directory_path = jobs_root_directory_path.join(job_id);
@@ -1272,12 +1274,15 @@ fn create_watch_job_from_bundle(
       .insert(job_root_directory_path.clone(), job_state_file_path(&job_root_directory_path));
   }
 
-  spawn_job_process(job_runtime_state, job_root_directory_path.clone())?;
+  if auto_run {
+    spawn_job_process(job_runtime_state, job_root_directory_path.clone())?;
+  }
   Ok(job_root_directory_path)
 }
 
 fn make_watch_folder_poll_callback(
   shared_job_runtime_state: SharedJobRuntimeState,
+  auto_run: bool,
 ) -> Arc<dyn Fn(&WatchFolderConfig) -> Result<(), String> + Send + Sync> {
   Arc::new(move |config: &WatchFolderConfig| {
     if is_any_job_running(&shared_job_runtime_state) {
@@ -1296,6 +1301,7 @@ fn make_watch_folder_poll_callback(
         shared_job_runtime_state.clone(),
         &config.jobs_root_directory_path,
         &bundle_directory_path,
+        auto_run,
       );
       if let Err(error_message) = create_result {
         let _ = mark_bundle_failed(&bundle_directory_path, &error_message);
@@ -1565,7 +1571,7 @@ fn main() {
         jobs_root_directory_path,
         poll_interval: default_watch_poll_interval(),
       };
-      let poll_callback = make_watch_folder_poll_callback(job_runtime_state.clone());
+      let poll_callback = make_watch_folder_poll_callback(job_runtime_state.clone(), false);
       let _ = start_watch_folder_with_callback(&watch_folder_state, config, poll_callback);
     }
   }

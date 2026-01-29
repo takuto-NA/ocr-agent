@@ -44,6 +44,7 @@ const WATCH_STATUS_POLL_INTERVAL_MILLIS = 1100;
 
 const LOCAL_STORAGE_WATCH_INBOX_DIRECTORY_PATH_KEY = "ocr-agent.watchInboxDirectoryPath";
 const LOCAL_STORAGE_WATCH_JOBS_ROOT_DIRECTORY_PATH_KEY = "ocr-agent.watchJobsRootDirectoryPath";
+const LOCAL_STORAGE_WATCH_AUTO_RUN_ENABLED_KEY = "ocr-agent.watchAutoRunEnabled";
 
 const DEFAULT_DEEPSEEK_OCR2_BASE_IMAGE_SIZE_PIXELS = 1024;
 const DEFAULT_DEEPSEEK_OCR2_INFERENCE_IMAGE_SIZE_PIXELS = 768;
@@ -128,6 +129,7 @@ export function App() {
   const [watchInboxDirectoryPath, setWatchInboxDirectoryPath] = useState<string>("");
   const [watchJobsRootDirectoryPath, setWatchJobsRootDirectoryPath] = useState<string>("");
   const [watchFolderStatus, setWatchFolderStatus] = useState<WatchFolderStatus | null>(null);
+  const [isWatchAutoRunEnabled, setIsWatchAutoRunEnabled] = useState<boolean>(false);
 
   const jobRootDirectoryPathRef = useRef<string | null>(null);
   jobRootDirectoryPathRef.current = jobRootDirectoryPath;
@@ -185,8 +187,10 @@ export function App() {
     try {
       const inbox = window.localStorage.getItem(LOCAL_STORAGE_WATCH_INBOX_DIRECTORY_PATH_KEY) ?? "";
       const jobsRoot = window.localStorage.getItem(LOCAL_STORAGE_WATCH_JOBS_ROOT_DIRECTORY_PATH_KEY) ?? "";
+      const autoRunRaw = window.localStorage.getItem(LOCAL_STORAGE_WATCH_AUTO_RUN_ENABLED_KEY) ?? "0";
       setWatchInboxDirectoryPath(inbox);
       setWatchJobsRootDirectoryPath(jobsRoot);
+      setIsWatchAutoRunEnabled(autoRunRaw === "1");
     } catch {
       // Guard: localStorage access may fail in some environments.
     }
@@ -650,7 +654,8 @@ export function App() {
       appendUiLogLine("[watch-folder] starting…");
       await invoke("start_watch_folder", {
         inboxDirectoryPath: inbox,
-        jobsRootDirectoryPath: watchJobsRootDirectoryPath.trim() === "" ? null : watchJobsRootDirectoryPath.trim()
+        jobsRootDirectoryPath: watchJobsRootDirectoryPath.trim() === "" ? null : watchJobsRootDirectoryPath.trim(),
+        autoRun: isWatchAutoRunEnabled
       });
       appendUiLogLine("[watch-folder] started");
     } catch (error) {
@@ -873,6 +878,27 @@ export function App() {
                     Stop
                   </button>
                 </div>
+
+                <div style={{ height: 10 }} />
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={isWatchAutoRunEnabled}
+                    onChange={(event) => {
+                      const next = event.target.checked;
+                      setIsWatchAutoRunEnabled(next);
+                      try {
+                        window.localStorage.setItem(LOCAL_STORAGE_WATCH_AUTO_RUN_ENABLED_KEY, next ? "1" : "0");
+                      } catch {
+                        // Guard: localStorage failures should not break UX.
+                      }
+                    }}
+                    disabled={!isRunningInsideTauri || watchFolderStatus?.is_running === true}
+                  />
+                  <span className="toggleLabel">
+                    Auto-run OCR after ingest (can be heavy; recommended OFF)
+                  </span>
+                </label>
 
                 <div style={{ height: 10 }} />
                 <div className="label">
